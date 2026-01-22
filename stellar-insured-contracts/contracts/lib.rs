@@ -1,13 +1,9 @@
 //! Shared library for Stellar Insured Soroban contracts
-//! 
+//!
 //! This module contains common types, utilities, and error handling
 //! used across all insurance contracts in the Stellar Insured ecosystem.
 
-pub mod types;
-pub mod errors;
-pub mod utils;
-
-use soroban_sdk::{contracttype, Address, Env};
+use soroban_sdk::{contracttype, Address, Env, Symbol, String};
 
 /// Common contract types shared across all insurance contracts
 pub mod types {
@@ -59,13 +55,13 @@ pub mod types {
         Admin,
         Paused,
         Config,
-        Counter(String),
+        Counter(Symbol),
     }
 }
 
 /// Common error types for insurance contracts
 pub mod errors {
-    use soroban_sdk::{contract_error, contracterror, Error};
+    use soroban_sdk::{contracterror, Error};
 
     #[contracterror]
     #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -99,13 +95,9 @@ pub mod utils {
     use crate::errors::ContractError;
     use soroban_sdk::Vec;
 
-    /// Validate that an address is not zero
-    pub fn validate_address(env: &Env, address: &Address) -> Result<(), Error> {
-        if address.is_none() {
-            Err(ContractError::InvalidInput.into())
-        } else {
-            Ok(())
-        }
+    /// Validate that an address is valid (all Soroban addresses are valid by construction)
+    pub fn validate_address(_env: &Env, _address: &Address) -> Result<(), ContractError> {
+        Ok(())
     }
 
     /// Check if contract is paused
@@ -125,7 +117,7 @@ pub mod utils {
 
     /// Get next ID for a given counter
     pub fn next_id(env: &Env, counter_name: &str) -> u64 {
-        let key = crate::types::DataKey::Counter(counter_name.to_string());
+        let key = crate::types::DataKey::Counter(Symbol::new(env, counter_name));
         let current_id = env.storage().persistent().get(&key).unwrap_or(0u64);
         let next_id = current_id + 1;
         env.storage().persistent().set(&key, &next_id);
@@ -133,11 +125,7 @@ pub mod utils {
     }
 
     /// Create a simple event log entry
-    pub fn log_event(env: &Env, event_type: &str, data: Vec<&str>) {
-        let mut event_data = Vec::new(env);
-        for item in data {
-            event_data.push_back(item);
-        }
-        env.events().publish((event_type, ()), event_data);
+    pub fn log_event(env: &Env, event_type: &str, data: Vec<String>) {
+        env.events().publish((event_type, ()), data);
     }
 }

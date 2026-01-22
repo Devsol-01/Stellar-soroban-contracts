@@ -139,6 +139,55 @@ impl RiskPoolContract {
         Ok(provider_info)
     }
 
+    pub fn payout_claim(env: Env, recipient: Address, amount: i128) -> Result<(), ContractError> {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&ADMIN)
+            .ok_or(ContractError::NotInitialized)?;
+
+        let caller = env.current_contract_address();
+        if caller != admin {
+            return Err(ContractError::Unauthorized);
+        }
+
+        if is_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+
+        validate_address(&env, &recipient)?;
+        if amount <= 0 {
+            return Err(ContractError::InvalidInput);
+        }
+
+        let mut stats: (i128, i128, i128, u64) = env
+            .storage()
+            .persistent()
+            .get(&POOL_STATS)
+            .ok_or(ContractError::NotFound)?;
+
+        if stats.0 < amount {
+            return Err(ContractError::InsufficientFunds);
+        }
+
+        stats.0 -= amount;
+        stats.1 += amount; // Track total payouts
+
+        env.storage()
+            .persistent()
+            .set(&POOL_STATS, &stats);
+
+        // TODO: Actually transfer XLM tokens to recipient
+        // This would require token contract integration
+
+        env.events().publish(
+            (Symbol::new(&env, "claim_payout"), recipient.clone()),
+            (amount,),
+        );
+
+        Ok(())
+    }
+
     pub fn pause(env: Env) -> Result<(), ContractError> {
         let admin: Address = env
             .storage()

@@ -10,6 +10,7 @@ path = "lib.rs"
 
 [dependencies]
 soroban-sdk = { workspace = true }
+insurance-contracts = { path = "../" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

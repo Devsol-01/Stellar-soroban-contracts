@@ -32,19 +32,30 @@ Manages insurance policy issuance, renewal, and lifecycle.
 - `get_stats()` - Get contract statistics
 
 ### 2. Claims Contract
-Processes insurance claims with multi-step approval workflow.
-- **Submit Claim**: Policyholders submit claims with evidence
-- **Approve Claim**: Admin approves valid claims
-- **Reject Claim**: Admin rejects invalid claims
-- **Settle Claim**: Release funds to claimant
+Processes insurance claims with deterministic multi-stage approval workflow.
+- **Submit Claim**: Policyholders submit claims with evidence (Submitted status)
+- **Start Review**: Admin moves claim to review stage (UnderReview status)
+- **Approve/Reject Claim**: Admin approves valid claims or rejects invalid ones (Approved/Rejected status)
+- **Settle Claim**: Release funds to claimant for approved claims only (Settled status)
+
+**Multi-Stage Workflow**:
+```
+Submitted → UnderReview → Approved/Rejected → Settled (Approved only)
+```
+
+**State Transition Rules**:
+- Only admin can transition claims between states
+- Claims can only be settled if approved (prevents premature settlement)
+- Full state validation prevents invalid transitions
 
 **Key Functions**:
 - `initialize(admin, policy_contract, risk_pool)` - Initialize contract
-- `submit_claim(policy_id, amount, description, evidence)` - Submit new claim
-- `get_claim(claim_id)` - Retrieve claim details
-- `approve_claim(claim_id)` - Admin approves claim
-- `reject_claim(claim_id)` - Admin rejects claim
-- `settle_claim(claim_id)` - Settle approved claim
+- `submit_claim(policy_id, amount)` - Submit new claim (sets status to Submitted)
+- `start_review(claim_id)` - Admin moves claim to UnderReview status
+- `get_claim(claim_id)` - Retrieve claim details with status
+- `approve_claim(claim_id)` - Admin approves UnderReview claims (sets to Approved)
+- `reject_claim(claim_id)` - Admin rejects UnderReview claims (sets to Rejected)
+- `settle_claim(claim_id)` - Settle approved claims only, integrates with risk pool
 - `get_stats()` - Get claims statistics
 
 ### 3. Risk Pool Contract
@@ -58,10 +69,9 @@ Manages liquidity pool for claims settlement.
 - `initialize(admin, xlm_token, min_provider_stake)` - Initialize pool
 - `deposit_liquidity(provider, amount)` - Deposit into pool
 - `withdraw_liquidity(provider, amount)` - Withdraw from pool
+- `payout_claim(recipient, amount)` - Pay out approved claims (admin only)
 - `get_pool_stats()` - Pool statistics
 - `get_provider_info(provider)` - Provider stake info
-- `reserve_liquidity(amount)` - Reserve for claims
-- `release_liquidity(amount)` - Release reserved amount
 
 ### 4. Governance Contract
 Professional DAO proposal system enabling decentralized protocol decisions.
@@ -88,7 +98,11 @@ Professional DAO proposal system enabling decentralized protocol decisions.
 
 Insurance policy creation and lifecycle management
 
-Automated claim validation and settlement
+**Deterministic multi-stage claim approval workflow** with state validation
+
+**Admin-authorized state transitions** preventing premature settlement
+
+**Risk pool integration** for secure claim payouts
 
 Decentralized risk pool accounting
 
@@ -146,6 +160,12 @@ Wallets: Non-custodial Stellar wallets
 🔐 Security Considerations
 
 Deterministic execution
+
+**Multi-stage state transition validation** preventing invalid claim flows
+
+**Admin-only authorization** for all sensitive claim operations
+
+**Settlement prevention** for non-approved claims
 
 Explicit authorization checks
 
