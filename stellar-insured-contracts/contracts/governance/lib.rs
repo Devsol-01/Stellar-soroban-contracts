@@ -1,10 +1,14 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracterror, Address, Env, Symbol, Vec};
 
+// Import authorization from the common library
+use insurance_contracts::authorization::{
+    initialize_admin, require_admin, require_governance_permission, Role, get_role
+};
+
 #[contract]
 pub struct GovernanceContract;
 
-const ADMIN: Symbol = Symbol::short("ADMIN");
 const PAUSED: Symbol = Symbol::short("PAUSED");
 const CONFIG: Symbol = Symbol::short("CONFIG");
 const PROPOSAL: Symbol = Symbol::short("PROPOSAL");
@@ -38,6 +42,20 @@ pub enum ContractError {
     ProposalNotActive = 12,
     QuorumNotMet = 13,
     ThresholdNotMet = 14,
+    InvalidRole = 15,
+    RoleNotFound = 16,
+    NotTrustedContract = 17,
+}
+
+impl From<insurance_contracts::authorization::AuthError> for ContractError {
+    fn from(err: insurance_contracts::authorization::AuthError) -> Self {
+        match err {
+            insurance_contracts::authorization::AuthError::Unauthorized => ContractError::Unauthorized,
+            insurance_contracts::authorization::AuthError::InvalidRole => ContractError::InvalidRole,
+            insurance_contracts::authorization::AuthError::RoleNotFound => ContractError::RoleNotFound,
+            insurance_contracts::authorization::AuthError::NotTrustedContract => ContractError::NotTrustedContract,
+        }
+    }
 }
 
 fn validate_address(_env: &Env, _address: &Address) -> Result<(), ContractError> {
@@ -55,21 +73,6 @@ fn set_paused(env: &Env, paused: bool) {
     env.storage()
         .persistent()
         .set(&PAUSED, &paused);
-}
-
-fn require_admin(env: &Env) -> Result<Address, ContractError> {
-    let admin: Address = env
-        .storage()
-        .persistent()
-        .get(&ADMIN)
-        .ok_or(ContractError::NotInitialized)?;
-    
-    let caller = env.current_contract_address();
-    if caller != admin {
-        return Err(ContractError::Unauthorized);
-    }
-    
-    Ok(admin)
 }
 
 fn is_voting_period_active(proposal_status: u32, voting_ends_at: u64, current_time: u64) -> bool {
@@ -110,7 +113,8 @@ impl GovernanceContract {
         min_voting_percentage: u32,
         min_quorum_percentage: u32,
     ) -> Result<(), ContractError> {
-        if env.storage().persistent().has(&ADMIN) {
+        // Check if already initialized
+        if insurance_contracts::authorization::get_admin(&env).is_some() {
             return Err(ContractError::AlreadyInitialized);
         }
 
@@ -129,23 +133,37 @@ impl GovernanceContract {
             return Err(ContractError::InvalidInput);
         }
 
-        env.storage().persistent().set(&ADMIN, &admin);
+        // Initialize authorization system with admin
+        admin.require_auth();
+        initialize_admin(&env, admin.clone());
+
         env.storage().persistent().set(
             &CONFIG, 
             &(token_contract, voting_period_days, min_voting_percentage, min_quorum_percentage)
         );
         env.storage().persistent().set(&PROPOSAL_COUNTER, &0u64);
         
+        env.events().publish(
+            (Symbol::new(&env, "initialized"), ()),
+            admin,
+        );
+        
         Ok(())
     }
 
     pub fn create_proposal(
         env: Env,
+        proposer: Address,
         title: Symbol,
         description: Symbol,
         execution_data: Symbol,
         threshold_percentage: u32,
     ) -> Result<u64, ContractError> {
+        // Verify identity - governance participants can create proposals
+        proposer.require_auth();
+        // Note: We could add governance role check here if we want to restrict proposal creation
+        // require_governance_permission(&env, &proposer)?;
+
         if is_paused(&env) {
             return Err(ContractError::Paused);
         }
@@ -159,8 +177,6 @@ impl GovernanceContract {
             .persistent()
             .get(&CONFIG)
             .ok_or(ContractError::NotInitialized)?;
-
-        let proposer = env.current_contract_address();
         let proposal_id: u64 = env
             .storage()
             .persistent()
@@ -223,10 +239,16 @@ impl GovernanceContract {
 
     pub fn vote(
         env: Env,
+        voter: Address,
         proposal_id: u64,
         vote_weight: i128,
         is_yes: bool,
     ) -> Result<(), ContractError> {
+        // Verify identity - anyone can vote (could add governance role check)
+        voter.require_auth();
+        // Note: We could add governance role check here if we want to restrict voting
+        // require_governance_permission(&env, &voter)?;
+
         if is_paused(&env) {
             return Err(ContractError::Paused);
         }
@@ -252,7 +274,6 @@ impl GovernanceContract {
             return Err(ContractError::VotingPeriodEnded);
         }
 
-        let voter = env.current_contract_address();
         if has_voted(&env, proposal_id, &voter) {
             return Err(ContractError::AlreadyVoted);
         }
@@ -360,15 +381,33 @@ impl GovernanceContract {
         Ok(())
     }
 
-    pub fn pause(env: Env) -> Result<(), ContractError> {
-        require_admin(&env)?;
+    pub fn pause(env: Env, admin: Address) -> Result<(), ContractError> {
+        // Verify identity and require admin permission
+        admin.require_auth();
+        require_admin(&env, &admin)?;
+        
         set_paused(&env, true);
+        
+        env.events().publish(
+            (Symbol::new(&env, "paused"), ()),
+            admin,
+        );
+        
         Ok(())
     }
 
-    pub fn unpause(env: Env) -> Result<(), ContractError> {
-        require_admin(&env)?;
+    pub fn unpause(env: Env, admin: Address) -> Result<(), ContractError> {
+        // Verify identity and require admin permission
+        admin.require_auth();
+        require_admin(&env, &admin)?;
+        
         set_paused(&env, false);
+        
+        env.events().publish(
+            (Symbol::new(&env, "unpaused"), ()),
+            admin,
+        );
+        
         Ok(())
     }
 
@@ -438,13 +477,8 @@ impl GovernanceContract {
     }
 
     pub fn get_admin(env: Env) -> Result<Address, ContractError> {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&ADMIN)
-            .ok_or(ContractError::NotInitialized)?;
-        
-        Ok(admin)
+        insurance_contracts::authorization::get_admin(&env)
+            .ok_or(ContractError::NotInitialized)
     }
 
     pub fn is_contract_paused(env: Env) -> bool {
@@ -459,5 +493,40 @@ impl GovernanceContract {
             .unwrap_or(0);
         
         Ok(count)
+    }
+    
+    /// Grant governance role to an address (admin only)
+    pub fn grant_governance_role(env: Env, admin: Address, participant: Address) -> Result<(), ContractError> {
+        admin.require_auth();
+        require_admin(&env, &admin)?;
+        
+        insurance_contracts::authorization::grant_role(&env, &admin, &participant, Role::Governance)?;
+        
+        env.events().publish(
+            (Symbol::new(&env, "role_granted"), participant.clone()),
+            admin,
+        );
+        
+        Ok(())
+    }
+    
+    /// Revoke governance role from an address (admin only)
+    pub fn revoke_governance_role(env: Env, admin: Address, participant: Address) -> Result<(), ContractError> {
+        admin.require_auth();
+        require_admin(&env, &admin)?;
+        
+        insurance_contracts::authorization::revoke_role(&env, &admin, &participant)?;
+        
+        env.events().publish(
+            (Symbol::new(&env, "role_revoked"), participant.clone()),
+            admin,
+        );
+        
+        Ok(())
+    }
+    
+    /// Get the role of an address
+    pub fn get_user_role(env: Env, address: Address) -> Role {
+        get_role(&env, &address)
     }
 }

@@ -1,13 +1,18 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracterror, contracttype, Address, Env, Symbol};
 
+// Import authorization from the common library
+use insurance_contracts::authorization::{
+    initialize_admin, require_admin, require_policy_management,
+    register_trusted_contract, Role, get_role
+};
+
 #[contract]
 pub struct PolicyContract;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
-    Admin,
     Paused,
     Config,
     Policy(u64),
@@ -54,6 +59,20 @@ pub enum ContractError {
     Overflow = 8,
     NotInitialized = 9,
     AlreadyInitialized = 10,
+    InvalidRole = 11,
+    RoleNotFound = 12,
+    NotTrustedContract = 13,
+}
+
+impl From<insurance_contracts::authorization::AuthError> for ContractError {
+    fn from(err: insurance_contracts::authorization::AuthError) -> Self {
+        match err {
+            insurance_contracts::authorization::AuthError::Unauthorized => ContractError::Unauthorized,
+            insurance_contracts::authorization::AuthError::InvalidRole => ContractError::InvalidRole,
+            insurance_contracts::authorization::AuthError::RoleNotFound => ContractError::RoleNotFound,
+            insurance_contracts::authorization::AuthError::NotTrustedContract => ContractError::NotTrustedContract,
+        }
+    }
 }
 
 fn validate_address(_env: &Env, _address: &Address) -> Result<(), ContractError> {
@@ -73,22 +92,6 @@ fn set_paused(env: &Env, paused: bool) {
         .set(&DataKey::Paused, &paused);
 }
 
-fn get_admin(env: &Env) -> Result<Address, ContractError> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::Admin)
-        .ok_or(ContractError::NotInitialized)
-}
-
-fn require_admin(env: &Env) -> Result<(), ContractError> {
-    let admin = get_admin(env)?;
-    let caller = env.current_contract_address();
-    if caller != admin {
-        return Err(ContractError::Unauthorized);
-    }
-    Ok(())
-}
-
 fn next_policy_id(env: &Env) -> u64 {
     let current_id: u64 = env
         .storage()
@@ -105,14 +108,20 @@ fn next_policy_id(env: &Env) -> u64 {
 #[contractimpl]
 impl PolicyContract {
     pub fn initialize(env: Env, admin: Address, risk_pool: Address) -> Result<(), ContractError> {
-        if env.storage().persistent().has(&DataKey::Admin) {
+        // Check if already initialized
+        if insurance_contracts::authorization::get_admin(&env).is_some() {
             return Err(ContractError::AlreadyInitialized);
         }
 
         validate_address(&env, &admin)?;
         validate_address(&env, &risk_pool)?;
 
-        env.storage().persistent().set(&DataKey::Admin, &admin);
+        // Initialize authorization system with admin
+        admin.require_auth();
+        initialize_admin(&env, admin.clone());
+        
+        // Register risk pool contract as trusted for cross-contract calls
+        register_trusted_contract(&env, &admin, &risk_pool)?;
         
         let config = Config { risk_pool };
         env.storage().persistent().set(&DataKey::Config, &config);
@@ -123,17 +132,25 @@ impl PolicyContract {
         
         set_paused(&env, false);
 
+        env.events().publish(
+            (Symbol::new(&env, "initialized"), ()),
+            admin,
+        );
+
         Ok(())
     }
 
     pub fn issue_policy(
         env: Env,
+        manager: Address,
         holder: Address,
         coverage_amount: i128,
         premium_amount: i128,
         duration_days: u32,
     ) -> Result<u64, ContractError> {
-        get_admin(&env)?;
+        // Verify identity and require policy management permission
+        manager.require_auth();
+        require_policy_management(&env, &manager)?;
 
         if is_paused(&env) {
             return Err(ContractError::Paused);
@@ -228,7 +245,8 @@ impl PolicyContract {
     }
 
     pub fn get_admin(env: Env) -> Result<Address, ContractError> {
-        get_admin(&env)
+        insurance_contracts::authorization::get_admin(&env)
+            .ok_or(ContractError::NotInitialized)
     }
 
     pub fn get_config(env: Env) -> Result<Config, ContractError> {
@@ -258,15 +276,68 @@ impl PolicyContract {
         is_paused(&env)
     }
 
-    pub fn pause(env: Env) -> Result<(), ContractError> {
-        require_admin(&env)?;
+    pub fn pause(env: Env, admin: Address) -> Result<(), ContractError> {
+        // Verify identity and require admin permission
+        admin.require_auth();
+        require_admin(&env, &admin)?;
+        
         set_paused(&env, true);
+        
+        env.events().publish(
+            (Symbol::new(&env, "paused"), ()),
+            admin,
+        );
+        
         Ok(())
     }
 
-    pub fn unpause(env: Env) -> Result<(), ContractError> {
-        require_admin(&env)?;
+    pub fn unpause(env: Env, admin: Address) -> Result<(), ContractError> {
+        // Verify identity and require admin permission
+        admin.require_auth();
+        require_admin(&env, &admin)?;
+        
         set_paused(&env, false);
+        
+        env.events().publish(
+            (Symbol::new(&env, "unpaused"), ()),
+            admin,
+        );
+        
         Ok(())
+    }
+    
+    /// Grant policy manager role to an address (admin only)
+    pub fn grant_manager_role(env: Env, admin: Address, manager: Address) -> Result<(), ContractError> {
+        admin.require_auth();
+        require_admin(&env, &admin)?;
+        
+        insurance_contracts::authorization::grant_role(&env, &admin, &manager, Role::PolicyManager)?;
+        
+        env.events().publish(
+            (Symbol::new(&env, "role_granted"), manager.clone()),
+            admin,
+        );
+        
+        Ok(())
+    }
+    
+    /// Revoke policy manager role from an address (admin only)
+    pub fn revoke_manager_role(env: Env, admin: Address, manager: Address) -> Result<(), ContractError> {
+        admin.require_auth();
+        require_admin(&env, &admin)?;
+        
+        insurance_contracts::authorization::revoke_role(&env, &admin, &manager)?;
+        
+        env.events().publish(
+            (Symbol::new(&env, "role_revoked"), manager.clone()),
+            admin,
+        );
+        
+        Ok(())
+    }
+    
+    /// Get the role of an address
+    pub fn get_user_role(env: Env, address: Address) -> Role {
+        get_role(&env, &address)
     }
 }

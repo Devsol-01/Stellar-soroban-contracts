@@ -1,16 +1,13 @@
 [package]
-name = "policy-contract"
+name = "authorization"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "policy_contract"
-crate-type = ["cdylib"]
-path = "lib.rs"
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
-insurance-contracts = { path = "../" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

@@ -1,10 +1,15 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracterror, Address, Env, Symbol};
 
+// Import authorization from the common library
+use insurance_contracts::authorization::{
+    initialize_admin, require_admin, require_risk_pool_management,
+    require_trusted_contract, register_trusted_contract, Role, get_role
+};
+
 #[contract]
 pub struct RiskPoolContract;
 
-const ADMIN: Symbol = Symbol::short("ADMIN");
 const PAUSED: Symbol = Symbol::short("PAUSED");
 const CONFIG: Symbol = Symbol::short("CONFIG");
 const POOL_STATS: Symbol = Symbol::short("POOL_ST");
@@ -24,6 +29,20 @@ pub enum ContractError {
     InvalidState = 7,
     NotInitialized = 9,
     AlreadyInitialized = 10,
+    InvalidRole = 11,
+    RoleNotFound = 12,
+    NotTrustedContract = 13,
+}
+
+impl From<insurance_contracts::authorization::AuthError> for ContractError {
+    fn from(err: insurance_contracts::authorization::AuthError) -> Self {
+        match err {
+            insurance_contracts::authorization::AuthError::Unauthorized => ContractError::Unauthorized,
+            insurance_contracts::authorization::AuthError::InvalidRole => ContractError::InvalidRole,
+            insurance_contracts::authorization::AuthError::RoleNotFound => ContractError::RoleNotFound,
+            insurance_contracts::authorization::AuthError::NotTrustedContract => ContractError::NotTrustedContract,
+        }
+    }
 }
 
 fn validate_address(_env: &Env, _address: &Address) -> Result<(), ContractError> {
@@ -43,38 +62,38 @@ fn set_paused(env: &Env, paused: bool) {
         .set(&PAUSED, &paused);
 }
 
-fn require_reservation_admin(env: &Env) -> Result<Address, ContractError> {
-    let admin: Address = env
-        .storage()
-        .persistent()
-        .get(&ADMIN)
-        .ok_or(ContractError::NotInitialized)?;
-    let caller = env.current_contract_address();
-    if caller != admin {
-        return Err(ContractError::Unauthorized);
-    }
-    Ok(admin)
-}
-
 #[contractimpl]
 impl RiskPoolContract {
-    pub fn initialize(env: Env, admin: Address, xlm_token: Address, min_provider_stake: i128) -> Result<(), ContractError> {
-        if env.storage().persistent().has(&ADMIN) {
+    pub fn initialize(env: Env, admin: Address, xlm_token: Address, min_provider_stake: i128, claims_contract: Address) -> Result<(), ContractError> {
+        // Check if already initialized
+        if insurance_contracts::authorization::get_admin(&env).is_some() {
             return Err(ContractError::AlreadyInitialized);
         }
 
         validate_address(&env, &admin)?;
         validate_address(&env, &xlm_token)?;
+        validate_address(&env, &claims_contract)?;
 
         if min_provider_stake <= 0 {
             return Err(ContractError::InvalidInput);
         }
 
-        env.storage().persistent().set(&ADMIN, &admin);
+        // Initialize authorization system with admin
+        admin.require_auth();
+        initialize_admin(&env, admin.clone());
+        
+        // Register claims contract as trusted for cross-contract calls
+        register_trusted_contract(&env, &admin, &claims_contract)?;
+
         env.storage().persistent().set(&CONFIG, &(xlm_token, min_provider_stake));
         
         let stats = (0i128, 0i128, 0i128, 0u64);
         env.storage().persistent().set(&POOL_STATS, &stats);
+        
+        env.events().publish(
+            (Symbol::new(&env, "initialized"), ()),
+            admin,
+        );
         
         Ok(())
     }
@@ -154,8 +173,10 @@ impl RiskPoolContract {
         Ok(provider_info)
     }
 
-    pub fn reserve_liquidity(env: Env, claim_id: u64, amount: i128) -> Result<(), ContractError> {
-        require_reservation_admin(&env)?;
+    pub fn reserve_liquidity(env: Env, caller_contract: Address, claim_id: u64, amount: i128) -> Result<(), ContractError> {
+        // Verify that the caller is a trusted contract (e.g., claims contract)
+        caller_contract.require_auth();
+        require_trusted_contract(&env, &caller_contract)?;
 
         if is_paused(&env) {
             return Err(ContractError::Paused);
@@ -207,8 +228,10 @@ impl RiskPoolContract {
         Ok(())
     }
 
-    pub fn payout_reserved_claim(env: Env, claim_id: u64, recipient: Address) -> Result<(), ContractError> {
-        require_reservation_admin(&env)?;
+    pub fn payout_reserved_claim(env: Env, caller_contract: Address, claim_id: u64, recipient: Address) -> Result<(), ContractError> {
+        // Verify that the caller is a trusted contract (e.g., claims contract)
+        caller_contract.require_auth();
+        require_trusted_contract(&env, &caller_contract)?;
 
         if is_paused(&env) {
             return Err(ContractError::Paused);
@@ -268,17 +291,10 @@ impl RiskPoolContract {
         Ok(())
     }
 
-    pub fn payout_claim(env: Env, recipient: Address, amount: i128) -> Result<(), ContractError> {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&ADMIN)
-            .ok_or(ContractError::NotInitialized)?;
-
-        let caller = env.current_contract_address();
-        if caller != admin {
-            return Err(ContractError::Unauthorized);
-        }
+    pub fn payout_claim(env: Env, manager: Address, recipient: Address, amount: i128) -> Result<(), ContractError> {
+        // Verify identity and require risk pool management permission
+        manager.require_auth();
+        require_risk_pool_management(&env, &manager)?;
 
         if is_paused(&env) {
             return Err(ContractError::Paused);
@@ -322,35 +338,68 @@ impl RiskPoolContract {
         Ok(())
     }
 
-    pub fn pause(env: Env) -> Result<(), ContractError> {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&ADMIN)
-            .ok_or(ContractError::NotInitialized)?;
-
-        let caller = env.current_contract_address();
-        if caller != admin {
-            return Err(ContractError::Unauthorized);
-        }
+    pub fn pause(env: Env, admin: Address) -> Result<(), ContractError> {
+        // Verify identity and require admin permission
+        admin.require_auth();
+        require_admin(&env, &admin)?;
 
         set_paused(&env, true);
+        
+        env.events().publish(
+            (Symbol::new(&env, "paused"), ()),
+            admin,
+        );
+        
         Ok(())
     }
 
-    pub fn unpause(env: Env) -> Result<(), ContractError> {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&ADMIN)
-            .ok_or(ContractError::NotInitialized)?;
-
-        let caller = env.current_contract_address();
-        if caller != admin {
-            return Err(ContractError::Unauthorized);
-        }
+    pub fn unpause(env: Env, admin: Address) -> Result<(), ContractError> {
+        // Verify identity and require admin permission
+        admin.require_auth();
+        require_admin(&env, &admin)?;
 
         set_paused(&env, false);
+        
+        env.events().publish(
+            (Symbol::new(&env, "unpaused"), ()),
+            admin,
+        );
+        
         Ok(())
+    }
+    
+    /// Grant risk pool manager role to an address (admin only)
+    pub fn grant_manager_role(env: Env, admin: Address, manager: Address) -> Result<(), ContractError> {
+        admin.require_auth();
+        require_admin(&env, &admin)?;
+        
+        insurance_contracts::authorization::grant_role(&env, &admin, &manager, Role::RiskPoolManager)?;
+        
+        env.events().publish(
+            (Symbol::new(&env, "role_granted"), manager.clone()),
+            admin,
+        );
+        
+        Ok(())
+    }
+    
+    /// Revoke risk pool manager role from an address (admin only)
+    pub fn revoke_manager_role(env: Env, admin: Address, manager: Address) -> Result<(), ContractError> {
+        admin.require_auth();
+        require_admin(&env, &admin)?;
+        
+        insurance_contracts::authorization::revoke_role(&env, &admin, &manager)?;
+        
+        env.events().publish(
+            (Symbol::new(&env, "role_revoked"), manager.clone()),
+            admin,
+        );
+        
+        Ok(())
+    }
+    
+    /// Get the role of an address
+    pub fn get_user_role(env: Env, address: Address) -> Role {
+        get_role(&env, &address)
     }
 }
