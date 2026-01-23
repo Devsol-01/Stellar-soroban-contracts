@@ -3,7 +3,9 @@
 //! This module contains common types, utilities, and error handling
 //! used across all insurance contracts in the Stellar Insured ecosystem.
 
-use soroban_sdk::{contracttype, Address, Env, Symbol, String};
+#![no_std]
+
+use soroban_sdk::{contracttype, Address, Env, Symbol, String, BytesN};
 
 /// Re-export authorization module for easy access
 /// Import authorization functions like: use insurance_contracts::authorization::*;
@@ -63,7 +65,16 @@ pub mod types {
         No,
     }
 
-    /// Common data key for contract storage
+    /// Evidence record (hash-only, immutable)
+    #[contracttype]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct ClaimEvidence {
+        pub claim_id: BytesN<32>,
+        pub evidence_hash: BytesN<32>, // SHA-256
+        pub submitter: Address,
+    }
+
+    /// Common data keys for contract storage
     #[contracttype]
     #[derive(Clone, Debug)]
     pub enum DataKey {
@@ -71,6 +82,9 @@ pub mod types {
         Paused,
         Config,
         Counter(Symbol),
+
+        /// Claim evidence storage
+        ClaimEvidence(BytesN<32>), // claim_id → evidence
     }
 }
 
@@ -81,25 +95,15 @@ pub mod errors {
     #[contracterror]
     #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
     pub enum ContractError {
-        /// Unauthorized access
         Unauthorized = 1,
-        /// Contract is paused
         Paused = 2,
-        /// Invalid input parameters
         InvalidInput = 3,
-        /// Insufficient funds
         InsufficientFunds = 4,
-        /// Item not found
         NotFound = 5,
-        /// Item already exists
         AlreadyExists = 6,
-        /// Invalid state transition
         InvalidState = 7,
-        /// Arithmetic overflow
         Overflow = 8,
-        /// Contract not initialized
         NotInitialized = 9,
-        /// Already initialized
         AlreadyInitialized = 10,
         /// Invalid role or permission
         InvalidRole = 11,
@@ -119,16 +123,21 @@ pub mod errors {
                 super::authorization::AuthError::NotTrustedContract => ContractError::NotTrustedContract,
             }
         }
+
+        /// 🔐 Evidence-specific errors
+        EvidenceAlreadyExists = 20,
+        EvidenceNotFound = 21,
+        InvalidEvidenceHash = 22,
     }
 }
 
 /// Utility functions for contract operations
 pub mod utils {
     use super::*;
-    use crate::errors::ContractError;
+    use crate::{errors::ContractError, types::*};
     use soroban_sdk::Vec;
 
-    /// Validate that an address is valid (all Soroban addresses are valid by construction)
+    /// Validate that an address is valid
     pub fn validate_address(_env: &Env, _address: &Address) -> Result<(), ContractError> {
         Ok(())
     }
@@ -137,24 +146,79 @@ pub mod utils {
     pub fn is_paused(env: &Env) -> bool {
         env.storage()
             .persistent()
-            .get(&crate::types::DataKey::Paused)
+            .get(&DataKey::Paused)
             .unwrap_or(false)
     }
 
-    /// Set contract pause status (admin only)
+    /// Set contract pause status
     pub fn set_paused(env: &Env, paused: bool) {
         env.storage()
             .persistent()
-            .set(&crate::types::DataKey::Paused, &paused);
+            .set(&DataKey::Paused, &paused);
     }
 
     /// Get next ID for a given counter
     pub fn next_id(env: &Env, counter_name: &str) -> u64 {
-        let key = crate::types::DataKey::Counter(Symbol::new(env, counter_name));
+        let key = DataKey::Counter(Symbol::new(env, counter_name));
         let current_id = env.storage().persistent().get(&key).unwrap_or(0u64);
         let next_id = current_id + 1;
         env.storage().persistent().set(&key, &next_id);
         next_id
+    }
+
+    /// 🔐 Store claim evidence hash (immutable)
+    pub fn store_claim_evidence(
+        env: &Env,
+        claim_id: BytesN<32>,
+        evidence_hash: BytesN<32>,
+        submitter: Address,
+    ) -> Result<(), ContractError> {
+        let key = DataKey::ClaimEvidence(claim_id.clone());
+
+        if env.storage().persistent().has(&key) {
+            return Err(ContractError::EvidenceAlreadyExists);
+        }
+
+        submitter.require_auth();
+
+        let record = ClaimEvidence {
+            claim_id,
+            evidence_hash,
+            submitter,
+        };
+
+        env.storage().persistent().set(&key, &record);
+        Ok(())
+    }
+
+    /// 🔍 Verify supplied hash against stored hash
+    pub fn verify_claim_evidence(
+        env: &Env,
+        claim_id: BytesN<32>,
+        provided_hash: BytesN<32>,
+    ) -> Result<bool, ContractError> {
+        let key = DataKey::ClaimEvidence(claim_id);
+
+        let record: ClaimEvidence = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::EvidenceNotFound)?;
+
+        Ok(record.evidence_hash == provided_hash)
+    }
+
+    /// Fetch stored evidence (read-only)
+    pub fn get_claim_evidence(
+        env: &Env,
+        claim_id: BytesN<32>,
+    ) -> Result<ClaimEvidence, ContractError> {
+        let key = DataKey::ClaimEvidence(claim_id);
+
+        env.storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::EvidenceNotFound)
     }
 
     /// Create a simple event log entry
