@@ -1,13 +1,21 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracterror, contracttype, Address, Env, Symbol};
 
+// Import authorization from the common library
+use insurance_contracts::authorization::{
+    initialize_admin, require_admin, require_policy_management,
+    register_trusted_contract, Role, get_role
+};
+
+// Import invariant checks and error types
+use insurance_invariants::{InvariantError, ProtocolInvariants};
+
 #[contract]
 pub struct PolicyContract;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
-    Admin,
     Paused,
     Config,
     Policy(u64),
@@ -77,105 +85,37 @@ pub enum ContractError {
     Overflow = 8,
     NotInitialized = 9,
     AlreadyInitialized = 10,
-    InvalidStateTransition = 11,
+    InvalidRole = 11,
+    RoleNotFound = 12,
+    NotTrustedContract = 13,
+    // Invariant violation errors (100-199)
+    InvalidPolicyState = 101,
+    InvalidAmount = 103,
+    InvalidPremium = 106,
+    Overflow2 = 107,
 }
 
-// Step 3: Define a Policy Struct
-/// Represents an insurance policy with controlled state management.
-/// Note: In Soroban, all fields must be public for serialization, but we control
-/// state changes through methods that validate transitions.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Policy {
-    pub holder: Address,
-    pub coverage_amount: i128,
-    pub premium_amount: i128,
-    pub start_time: u64,
-    pub end_time: u64,
-    // Public for Soroban serialization, but state changes are controlled through methods
-    pub state: PolicyState,
-    pub created_at: u64,
-}
-
-// Step 4 & 6: Implement Safe State Transitions and State-Based Access Control
-impl Policy {
-    /// Creates a new policy in the Active state
-    pub fn new(
-        holder: Address,
-        coverage_amount: i128,
-        premium_amount: i128,
-        start_time: u64,
-        end_time: u64,
-        created_at: u64,
-    ) -> Self {
-        Self {
-            holder,
-            coverage_amount,
-            premium_amount,
-            start_time,
-            end_time,
-            state: PolicyState::Active,
-            created_at,
+impl From<insurance_contracts::authorization::AuthError> for ContractError {
+    fn from(err: insurance_contracts::authorization::AuthError) -> Self {
+        match err {
+            insurance_contracts::authorization::AuthError::Unauthorized => ContractError::Unauthorized,
+            insurance_contracts::authorization::AuthError::InvalidRole => ContractError::InvalidRole,
+            insurance_contracts::authorization::AuthError::RoleNotFound => ContractError::RoleNotFound,
+            insurance_contracts::authorization::AuthError::NotTrustedContract => ContractError::NotTrustedContract,
         }
-    }
-
-    /// Returns the current state of the policy (read-only access)
-    pub fn state(&self) -> PolicyState {
-        self.state
-    }
-
-    /// Attempts to transition the policy to a new state.
-    /// Returns an error if the transition is not allowed.
-    fn transition_to(&mut self, next: PolicyState) -> Result<(), ContractError> {
-        if !self.state.can_transition_to(next) {
-            return Err(ContractError::InvalidStateTransition);
-        }
-        self.state = next;
-        Ok(())
-    }
-
-    /// Cancels the policy. Only allowed when the policy is Active.
-    pub fn cancel(&mut self) -> Result<(), ContractError> {
-        if self.state != PolicyState::Active {
-            return Err(ContractError::InvalidState);
-        }
-        self.transition_to(PolicyState::Cancelled)
-    }
-
-    /// Expires the policy. Only allowed when the policy is Active.
-    pub fn expire(&mut self) -> Result<(), ContractError> {
-        if self.state != PolicyState::Active {
-            return Err(ContractError::InvalidState);
-        }
-        self.transition_to(PolicyState::Expired)
-    }
-
-    /// Checks if the policy is active
-    pub fn is_active(&self) -> bool {
-        self.state == PolicyState::Active
-    }
-
-    /// Checks if the policy is expired
-    pub fn is_expired(&self) -> bool {
-        self.state == PolicyState::Expired
-    }
-
-    /// Checks if the policy is cancelled
-    pub fn is_cancelled(&self) -> bool {
-        self.state == PolicyState::Cancelled
     }
 }
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Config {
-    pub risk_pool: Address,
-    pub min_coverage: i128,
-    pub max_coverage: i128,
-    pub min_premium: i128,
-    pub max_premium: i128,
-    pub min_duration_days: u32,
-    pub max_duration_days: u32,
+impl From<InvariantError> for ContractError {
+    fn from(err: InvariantError) -> Self {
+        match err {
+            InvariantError::InvalidPolicyState => ContractError::InvalidPolicyState,
+            InvariantError::InvalidAmount => ContractError::InvalidAmount,
+            InvariantError::InvalidPremium => ContractError::InvalidPremium,
+            InvariantError::Overflow => ContractError::Overflow2,
+            _ => ContractError::InvalidState,
+        }
+    }
 }
 
 fn validate_address(_env: &Env, _address: &Address) -> Result<(), ContractError> {
@@ -195,22 +135,6 @@ fn set_paused(env: &Env, paused: bool) {
         .set(&DataKey::Paused, &paused);
 }
 
-fn get_admin(env: &Env) -> Result<Address, ContractError> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::Admin)
-        .ok_or(ContractError::NotInitialized)
-}
-
-fn require_admin(env: &Env) -> Result<(), ContractError> {
-    let admin = get_admin(env)?;
-    let caller = env.current_contract_address();
-    if caller != admin {
-        return Err(ContractError::Unauthorized);
-    }
-    Ok(())
-}
-
 fn next_policy_id(env: &Env) -> u64 {
     let current_id: u64 = env
         .storage()
@@ -224,17 +148,54 @@ fn next_policy_id(env: &Env) -> u64 {
     next_id
 }
 
+/// I2: Validate policy state transition
+/// Maps valid state transitions for policy lifecycle:
+/// Active -> Expired (time-based), Cancelled, or Claimed
+fn is_valid_policy_state_transition(current: PolicyStatus, next: PolicyStatus) -> bool {
+    match (&current, &next) {
+        // Valid forward transitions
+        (PolicyStatus::Active, PolicyStatus::Expired) => true,
+        (PolicyStatus::Active, PolicyStatus::Cancelled) => true,
+        (PolicyStatus::Active, PolicyStatus::Claimed) => true,
+        (PolicyStatus::Expired, PolicyStatus::Claimed) => true,
+        // Invalid transitions
+        _ => false,
+    }
+}
+
+/// I4: Validate amount is positive
+fn validate_amount(amount: i128) -> Result<(), ContractError> {
+    if amount <= 0 {
+        return Err(ContractError::InvalidAmount);
+    }
+    Ok(())
+}
+
+/// I7: Validate premium is positive for active policies
+fn validate_premium(premium: i128) -> Result<(), ContractError> {
+    if premium <= 0 {
+        return Err(ContractError::InvalidPremium);
+    }
+    Ok(())
+}
+
 #[contractimpl]
 impl PolicyContract {
     pub fn initialize(env: Env, admin: Address, risk_pool: Address) -> Result<(), ContractError> {
-        if env.storage().persistent().has(&DataKey::Admin) {
+        // Check if already initialized
+        if insurance_contracts::authorization::get_admin(&env).is_some() {
             return Err(ContractError::AlreadyInitialized);
         }
 
         validate_address(&env, &admin)?;
         validate_address(&env, &risk_pool)?;
 
-        env.storage().persistent().set(&DataKey::Admin, &admin);
+        // Initialize authorization system with admin
+        admin.require_auth();
+        initialize_admin(&env, admin.clone());
+        
+        // Register risk pool contract as trusted for cross-contract calls
+        register_trusted_contract(&env, &admin, &risk_pool)?;
         
         let config = Config { risk_pool };
         env.storage().persistent().set(&DataKey::Config, &config);
@@ -245,17 +206,25 @@ impl PolicyContract {
         
         set_paused(&env, false);
 
+        env.events().publish(
+            (Symbol::new(&env, "initialized"), ()),
+            admin,
+        );
+
         Ok(())
     }
 
     pub fn issue_policy(
         env: Env,
+        manager: Address,
         holder: Address,
         coverage_amount: i128,
         premium_amount: i128,
         duration_days: u32,
     ) -> Result<u64, ContractError> {
-        get_admin(&env)?;
+        // Verify identity and require policy management permission
+        manager.require_auth();
+        require_policy_management(&env, &manager)?;
 
         if is_paused(&env) {
             return Err(ContractError::Paused);
@@ -263,9 +232,11 @@ impl PolicyContract {
 
         validate_address(&env, &holder)?;
 
-        if coverage_amount <= 0 || premium_amount <= 0 {
-            return Err(ContractError::InvalidInput);
-        }
+        // I4: Amount Non-Negativity - coverage must be positive
+        validate_amount(coverage_amount)?;
+
+        // I7: Premium Validity - premium must be positive for active policies
+        validate_premium(premium_amount)?;
 
         if duration_days == 0 || duration_days > 365 {
             return Err(ContractError::InvalidInput);
@@ -273,7 +244,7 @@ impl PolicyContract {
 
         let policy_id = next_policy_id(&env);
         let current_time = env.ledger().timestamp();
-        let end_time = current_time + (duration_days as u64 * 86400);
+        let end_time = current_time.checked_add(u64::from(duration_days).checked_mul(86400).ok_or(ContractError::Overflow2)?).ok_or(ContractError::Overflow2)?;
 
         // Use the new Policy constructor which initializes state to Active
         let policy = Policy::new(
@@ -400,7 +371,8 @@ impl PolicyContract {
     }
 
     pub fn get_admin(env: Env) -> Result<Address, ContractError> {
-        get_admin(&env)
+        insurance_contracts::authorization::get_admin(&env)
+            .ok_or(ContractError::NotInitialized)
     }
 
     pub fn get_config(env: Env) -> Result<Config, ContractError> {
@@ -430,255 +402,68 @@ impl PolicyContract {
         is_paused(&env)
     }
 
-    pub fn pause(env: Env) -> Result<(), ContractError> {
-        require_admin(&env)?;
+    pub fn pause(env: Env, admin: Address) -> Result<(), ContractError> {
+        // Verify identity and require admin permission
+        admin.require_auth();
+        require_admin(&env, &admin)?;
+        
         set_paused(&env, true);
+        
+        env.events().publish(
+            (Symbol::new(&env, "paused"), ()),
+            admin,
+        );
+        
         Ok(())
     }
 
-    pub fn unpause(env: Env) -> Result<(), ContractError> {
-        require_admin(&env)?;
+    pub fn unpause(env: Env, admin: Address) -> Result<(), ContractError> {
+        // Verify identity and require admin permission
+        admin.require_auth();
+        require_admin(&env, &admin)?;
+        
         set_paused(&env, false);
+        
+        env.events().publish(
+            (Symbol::new(&env, "unpaused"), ()),
+            admin,
+        );
+        
         Ok(())
     }
-}
-
-// Step 8: Add Exhaustive Tests
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_policy_state_valid_transitions() {
-        // Active → Expired is valid
-        assert!(PolicyState::Active.can_transition_to(PolicyState::Expired));
+    
+    /// Grant policy manager role to an address (admin only)
+    pub fn grant_manager_role(env: Env, admin: Address, manager: Address) -> Result<(), ContractError> {
+        admin.require_auth();
+        require_admin(&env, &admin)?;
         
-        // Active → Cancelled is valid
-        assert!(PolicyState::Active.can_transition_to(PolicyState::Cancelled));
-    }
-
-    #[test]
-    fn test_policy_state_invalid_transitions() {
-        // Expired → Active is invalid
-        assert!(!PolicyState::Expired.can_transition_to(PolicyState::Active));
+        insurance_contracts::authorization::grant_role(&env, &admin, &manager, Role::PolicyManager)?;
         
-        // Expired → Cancelled is invalid
-        assert!(!PolicyState::Expired.can_transition_to(PolicyState::Cancelled));
-        
-        // Cancelled → Active is invalid
-        assert!(!PolicyState::Cancelled.can_transition_to(PolicyState::Active));
-        
-        // Cancelled → Expired is invalid
-        assert!(!PolicyState::Cancelled.can_transition_to(PolicyState::Expired));
-        
-        // Self-transitions are invalid
-        assert!(!PolicyState::Active.can_transition_to(PolicyState::Active));
-        assert!(!PolicyState::Expired.can_transition_to(PolicyState::Expired));
-        assert!(!PolicyState::Cancelled.can_transition_to(PolicyState::Cancelled));
-    }
-
-    #[test]
-    fn test_policy_creation_starts_active() {
-        let holder = Address::from_contract_id(&[0u8; 32]);
-        let policy = Policy::new(
-            holder,
-            1000,
-            100,
-            0,
-            86400,
-            0,
+        env.events().publish(
+            (Symbol::new(&env, "role_granted"), manager.clone()),
+            admin,
         );
         
-        assert_eq!(policy.state(), PolicyState::Active);
-        assert!(policy.is_active());
-        assert!(!policy.is_expired());
-        assert!(!policy.is_cancelled());
+        Ok(())
     }
-
-    #[test]
-    fn test_policy_cancel_from_active_succeeds() {
-        let holder = Address::from_contract_id(&[0u8; 32]);
-        let mut policy = Policy::new(
-            holder,
-            1000,
-            100,
-            0,
-            86400,
-            0,
+    
+    /// Revoke policy manager role from an address (admin only)
+    pub fn revoke_manager_role(env: Env, admin: Address, manager: Address) -> Result<(), ContractError> {
+        admin.require_auth();
+        require_admin(&env, &admin)?;
+        
+        insurance_contracts::authorization::revoke_role(&env, &admin, &manager)?;
+        
+        env.events().publish(
+            (Symbol::new(&env, "role_revoked"), manager.clone()),
+            admin,
         );
         
-        let result = policy.cancel();
-        assert!(result.is_ok());
-        assert_eq!(policy.state(), PolicyState::Cancelled);
-        assert!(policy.is_cancelled());
+        Ok(())
     }
-
-    #[test]
-    fn test_policy_expire_from_active_succeeds() {
-        let holder = Address::from_contract_id(&[0u8; 32]);
-        let mut policy = Policy::new(
-            holder,
-            1000,
-            100,
-            0,
-            86400,
-            0,
-        );
-        
-        let result = policy.expire();
-        assert!(result.is_ok());
-        assert_eq!(policy.state(), PolicyState::Expired);
-        assert!(policy.is_expired());
-    }
-
-    #[test]
-    fn test_policy_cancel_from_expired_fails() {
-        let holder = Address::from_contract_id(&[0u8; 32]);
-        let mut policy = Policy::new(
-            holder,
-            1000,
-            100,
-            0,
-            86400,
-            0,
-        );
-        
-        // First expire the policy
-        policy.expire().unwrap();
-        
-        // Try to cancel - should fail
-        let result = policy.cancel();
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), ContractError::InvalidState);
-        
-        // State should remain Expired
-        assert_eq!(policy.state(), PolicyState::Expired);
-    }
-
-    #[test]
-    fn test_policy_expire_from_cancelled_fails() {
-        let holder = Address::from_contract_id(&[0u8; 32]);
-        let mut policy = Policy::new(
-            holder,
-            1000,
-            100,
-            0,
-            86400,
-            0,
-        );
-        
-        // First cancel the policy
-        policy.cancel().unwrap();
-        
-        // Try to expire - should fail
-        let result = policy.expire();
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), ContractError::InvalidState);
-        
-        // State should remain Cancelled
-        assert_eq!(policy.state(), PolicyState::Cancelled);
-    }
-
-    #[test]
-    fn test_policy_double_cancel_fails() {
-        let holder = Address::from_contract_id(&[0u8; 32]);
-        let mut policy = Policy::new(
-            holder,
-            1000,
-            100,
-            0,
-            86400,
-            0,
-        );
-        
-        // First cancel succeeds
-        policy.cancel().unwrap();
-        
-        // Second cancel fails
-        let result = policy.cancel();
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), ContractError::InvalidState);
-    }
-
-    #[test]
-    fn test_policy_double_expire_fails() {
-        let holder = Address::from_contract_id(&[0u8; 32]);
-        let mut policy = Policy::new(
-            holder,
-            1000,
-            100,
-            0,
-            86400,
-            0,
-        );
-        
-        // First expire succeeds
-        policy.expire().unwrap();
-        
-        // Second expire fails
-        let result = policy.expire();
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), ContractError::InvalidState);
-    }
-
-    #[test]
-    fn test_policy_state_checks() {
-        let holder = Address::from_contract_id(&[0u8; 32]);
-        
-        // Test Active state
-        let mut policy = Policy::new(holder.clone(), 1000, 100, 0, 86400, 0);
-        assert!(policy.is_active());
-        assert!(!policy.is_expired());
-        assert!(!policy.is_cancelled());
-        
-        // Test Expired state
-        policy.expire().unwrap();
-        assert!(!policy.is_active());
-        assert!(policy.is_expired());
-        assert!(!policy.is_cancelled());
-        
-        // Test Cancelled state
-        let mut policy2 = Policy::new(holder, 1000, 100, 0, 86400, 0);
-        policy2.cancel().unwrap();
-        assert!(!policy2.is_active());
-        assert!(!policy2.is_expired());
-        assert!(policy2.is_cancelled());
-    }
-
-    #[test]
-    fn test_no_panics_only_results() {
-        let holder = Address::from_contract_id(&[0u8; 32]);
-        let mut policy = Policy::new(
-            holder,
-            1000,
-            100,
-            0,
-            86400,
-            0,
-        );
-        
-        // All operations return Results, no panics
-        let _ = policy.cancel();
-        let _ = policy.expire();
-        let _ = policy.cancel();
-    }
-
-    #[test]
-    fn test_policy_state_derives() {
-        // Test Debug
-        let state = PolicyState::Active;
-        let debug_str = format!("{:?}", state);
-        assert!(debug_str.contains("Active"));
-        
-        // Test Clone and Copy
-        let state1 = PolicyState::Active;
-        let state2 = state1;
-        let state3 = state1.clone();
-        assert_eq!(state1, state2);
-        assert_eq!(state1, state3);
-        
-        // Test PartialEq and Eq
-        assert_eq!(PolicyState::Active, PolicyState::Active);
-        assert_ne!(PolicyState::Active, PolicyState::Expired);
+    
+    /// Get the role of an address
+    pub fn get_user_role(env: Env, address: Address) -> Role {
+        get_role(&env, &address)
     }
 }

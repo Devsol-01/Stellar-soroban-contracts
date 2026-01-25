@@ -73,6 +73,23 @@ Manages liquidity pool for claims settlement.
 - `get_pool_stats()` - Pool statistics
 - `get_provider_info(provider)` - Provider stake info
 
+### 5. Slashing Contract
+Professional on-chain slashing mechanism to penalize malicious or negligent actors.
+- **Slashable Roles**: Oracle providers, claim submitters, governance participants, risk pool providers
+- **Configurable Penalties**: DAO-controlled penalty percentages and multipliers
+- **Fund Redirection**: Slashed funds redirected to risk pool, treasury, or compensation fund
+- **Repeat Offender System**: Progressive penalties for multiple violations
+- **Cooldown Periods**: Time-based protection against excessive slashing
+
+**Key Functions**:
+- `initialize(admin, governance_contract, risk_pool_contract)` - Initialize with governance integration
+- `configure_penalty_parameters(role, reason, percentage, destination, multiplier, cooldown)` - Set penalty rules
+- `slash_funds(target, role, reason, amount)` - Execute slashing with validation
+- `add_slashable_role(role)` / `remove_slashable_role(role)` - Manage slashable roles
+- `get_slashing_history(target, role)` - View violation history
+- `get_violation_count(target, role)` - Check repeat offenses
+- `can_be_slashed(target, role)` - Verify slashing eligibility
+- `pause()` / `unpause()` - Emergency controls
 ### 4. Governance Contract
 Professional DAO proposal system enabling decentralized protocol decisions.
 - **Proposal Creation**: Create detailed proposals with title, description, and execution data
@@ -81,32 +98,30 @@ Professional DAO proposal system enabling decentralized protocol decisions.
 - **Read-only Queries**: Comprehensive query functions for proposal data and statistics
 
 **Key Functions**:
-- `initialize(admin, token_contract, voting_period_days, min_voting_percentage, min_quorum_percentage)` - Initialize with quorum requirements
+- `initialize(admin, token_contract, voting_period_days, min_voting_percentage, min_quorum_percentage, slashing_contract)` - Initialize with quorum requirements
 - `create_proposal(title, description, execution_data, threshold_percentage)` - Create detailed proposal
 - `get_proposal(proposal_id)` - Retrieve full proposal details
 - `vote(proposal_id, vote_weight, is_yes)` - Cast vote with duplicate prevention
 - `finalize_proposal(proposal_id)` - Finalize after voting period with quorum/threshold checks
 - `execute_proposal(proposal_id)` - Execute passed proposals
+- `create_slashing_proposal(target, role, reason, amount, evidence, threshold)` - Create slashing proposals
+- `execute_slashing_proposal(proposal_id)` - Execute approved slashing actions
 - `get_active_proposals()` - Query all active proposals
 - `get_proposal_stats(proposal_id)` - Get voting statistics
 - `get_all_proposals()` - List all proposals
 - `get_vote_record(proposal_id, voter)` - Check individual voting records
 
-
-
 ✨ Contract Features
 
 Insurance policy creation and lifecycle management
 
-**Deterministic multi-stage claim approval workflow** with state validation
-
-**Admin-authorized state transitions** preventing premature settlement
-
-**Risk pool integration** for secure claim payouts
+Automated claim validation and settlement
 
 Decentralized risk pool accounting
 
 Professional DAO governance with quorum and threshold requirements
+
+On-chain slashing mechanism with configurable penalties
 
 Deterministic and secure execution
 
@@ -115,6 +130,10 @@ Upgrade-ready contract architecture
 Comprehensive voting period enforcement
 
 Efficient proposal storage and querying system
+
+Progressive penalty system for repeat offenders
+
+Fund redirection to risk pool, treasury, or compensation
 
 🧑‍💻 Tech Stack
 
