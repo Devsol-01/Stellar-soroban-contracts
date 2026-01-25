@@ -2,10 +2,9 @@
 use soroban_sdk::{contract, contractimpl, contracterror, Address, Env, Symbol, symbol_short, IntoVal};
 
 // Import the Policy contract interface to verify ownership and coverage
-// TODO: Uncomment when policy_contract.wasm is available
-// mod policy_contract {
-//     soroban_sdk::contractimport!(file = "../../target/wasm32-unknown-unknown/release/policy_contract.wasm");
-// }
+mod policy_contract {
+    soroban_sdk::contractimport!(file = "../../target/wasm32-unknown-unknown/release/policy_contract.wasm");
+}
 
 // Import shared types and authorization from the common library
 use insurance_contracts::types::ClaimStatus;
@@ -18,9 +17,6 @@ use insurance_contracts::authorization::{
 use insurance_invariants::{InvariantError, ProtocolInvariants};
 
 // Oracle validation types
-use soroban_sdk::contracttype;
-
-#[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OracleValidationConfig {
     pub oracle_contract: Address,
@@ -35,8 +31,8 @@ const PAUSED: Symbol = symbol_short!("PAUSED");
 const CONFIG: Symbol = symbol_short!("CONFIG");
 const CLAIM: Symbol = symbol_short!("CLAIM");
 const POLICY_CLAIM: Symbol = symbol_short!("P_CLAIM");
-const ORACLE_CONFIG: Symbol = symbol_short!("ORA_CFG");
-const CLAIM_ORACLE_ID: Symbol = symbol_short!("CLM_ORA");
+const ORACLE_CONFIG: Symbol = symbol_short!("ORACLE_CFG");
+const CLAIM_ORACLE_ID: Symbol = symbol_short!("CLM_ORA_ID");
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -191,12 +187,6 @@ impl ClaimsContract {
         };
 
         env.storage().persistent().set(&ORACLE_CONFIG, &config);
-        
-        env.events().publish(
-            (symbol_short!("ora_cfg"), oracle_contract),
-            (require_oracle_validation, min_oracle_submissions),
-        );
-        
         Ok(())
     }
 
@@ -204,7 +194,7 @@ impl ClaimsContract {
     pub fn get_oracle_config(env: Env) -> Result<OracleValidationConfig, ContractError> {
         env.storage()
             .persistent()
-            .get(&ORACLE_CONFIG)
+            .get(&ORACLE_CFG)
             .ok_or(ContractError::NotFound)
     }
 
@@ -219,7 +209,7 @@ impl ClaimsContract {
         let oracle_config: OracleValidationConfig = env
             .storage()
             .persistent()
-            .get(&ORACLE_CONFIG)
+            .get(&ORACLE_CFG)
             .ok_or(ContractError::NotFound)?;
 
         if !oracle_config.require_oracle_validation {
@@ -251,7 +241,7 @@ impl ClaimsContract {
         // Store oracle data ID associated with claim for audit trail
         env.storage()
             .persistent()
-            .set(&(CLAIM_ORACLE_ID, claim_id), &oracle_data_id);
+            .set(&(CLM_ORA, claim_id), &oracle_data_id);
 
         Ok(true)
     }
@@ -260,11 +250,9 @@ impl ClaimsContract {
     pub fn get_claim_oracle_data(env: Env, claim_id: u64) -> Result<u64, ContractError> {
         env.storage()
             .persistent()
-            .get(&(CLAIM_ORACLE_ID, claim_id))
+            .get(&(CLM_ORA, claim_id))
             .ok_or(ContractError::NotFound)
     }
-
-    pub fn submit_claim(env: Env, claimant: Address, policy_id: u64, amount: i128) -> Result<u64, ContractError> {
         // 1. IDENTITY CHECK
         claimant.require_auth();
 
@@ -272,33 +260,29 @@ impl ClaimsContract {
             return Err(ContractError::Paused);
         }
 
-        // I4: Amount Non-Negativity - amount must be positive
-        validate_amount(amount)?;
-
-        // 2. FETCH POLICY DATA (Temporarily disabled - requires policy WASM)
-        let (_policy_contract_addr, _): (Address, Address) = env.storage()
+        // 2. FETCH POLICY DATA
+        let (policy_contract_addr, _): (Address, Address) = env.storage()
             .persistent()
             .get(&CONFIG)
             .ok_or(ContractError::NotInitialized)?;
 
-        // TODO: Uncomment when policy_contract.wasm is available
-        // let policy_client = policy_contract::Client::new(&env, &policy_contract_addr);
-        // let policy = policy_client.get_policy(&policy_id);
+        let policy_client = policy_contract::Client::new(&env, &policy_contract_addr);
+        let policy = policy_client.get_policy(&policy_id);
 
         // 3. OWNERSHIP CHECK (Verify policyholder identity)
-        // TODO: Uncomment when policy client is available
-        // if policy.0 != claimant {
-        //     return Err(ContractError::Unauthorized); 
-        // }
+        if policy.0 != claimant {
+            return Err(ContractError::Unauthorized); 
+        }
 
-        // 4. DUPLICATE CHECK (Check if this specific policy already has a claim)
+        // 3. DUPLICATE CHECK (Check if this specific policy already has a claim)
         if env.storage().persistent().has(&(POLICY_CLAIM, policy_id)) {
             return Err(ContractError::AlreadyExists);
         }
 
-        // 5. I6: COVERAGE CHECK (Enforce claim ≤ coverage)
-        // TODO: Uncomment when policy client is available with coverage_amount
-        // validate_coverage_constraint(amount, policy.1)?;
+        // 5. COVERAGE CHECK (Enforce claim ≤ coverage)
+        if amount <= 0 || amount > policy.1 {
+            return Err(ContractError::InvalidInput);
+        }
 
         // ID Generation
         let seq: u64 = env.ledger().sequence().into();
@@ -356,7 +340,7 @@ impl ClaimsContract {
         }
 
         // Check if oracle validation is required
-        if let Some(oracle_config) = env.storage().persistent().get::<_, OracleValidationConfig>(&ORACLE_CONFIG) {
+        if let Ok(oracle_config) = env.storage().persistent().get::<_, OracleValidationConfig>(&ORACLE_CONFIG) {
             if oracle_config.require_oracle_validation {
                 if let Some(oracle_id) = oracle_data_id {
                     // Verify oracle contract is trusted
@@ -372,7 +356,7 @@ impl ClaimsContract {
                     // Store oracle data ID associated with claim for audit trail
                     env.storage()
                         .persistent()
-                        .set(&(CLAIM_ORACLE_ID, claim_id), &oracle_id);
+                        .set(&(CLM_ORA, claim_id), &oracle_id);
                 } else {
                     return Err(ContractError::OracleValidationFailed);
                 }
@@ -591,4 +575,4 @@ impl ClaimsContract {
         get_role(&env, &address)
     }
 }
-// mod test; // TODO: Add tests
+mod test;

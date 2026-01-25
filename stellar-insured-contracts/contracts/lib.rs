@@ -1,3 +1,4 @@
+#![no_std]
 //! Shared library for Stellar Insured Soroban contracts
 //!
 //! This module contains common types, utilities, and error handling

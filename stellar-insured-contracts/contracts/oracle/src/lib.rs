@@ -1,20 +1,20 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracterror, contracttype, Address, Env, Symbol, Vec, Map,
+    contract, contractimpl, contracterror, contracttype, symbol_short, Address, Env, Symbol, Vec, Map,
 };
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-const ADMIN: Symbol = Symbol::short("ADMIN");
-const PAUSED: Symbol = Symbol::short("PAUSED");
-const CONFIG: Symbol = Symbol::short("CONFIG");
-const ORACLE_DATA: Symbol = Symbol::short("ORA_DATA");
-const ORACLE_HISTORY: Symbol = Symbol::short("ORA_HIST");
-const SUBMISSIONS: Symbol = Symbol::short("SUBS");
-const THRESHOLDS: Symbol = Symbol::short("THRESH");
+const ADMIN: Symbol = symbol_short!("ADMIN");
+const PAUSED: Symbol = symbol_short!("PAUSED");
+const CONFIG: Symbol = symbol_short!("CONFIG");
+const ORACLE_DATA: Symbol = symbol_short!("ORA_DATA");
+const ORACLE_HISTORY: Symbol = symbol_short!("ORA_HIST");
+const SUBMISSIONS: Symbol = symbol_short!("SUBS");
+const THRESHOLDS: Symbol = symbol_short!("THRESH");
 
 // Default thresholds for oracle validation
 const DEFAULT_MIN_SUBMISSIONS: u32 = 3;

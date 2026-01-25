@@ -14,8 +14,8 @@ members = [
 ]
 
 [workspace.dependencies]
-soroban-sdk = "21.7.7"
-soroban-sdk-macros = "21.7.7"
+soroban-sdk = "25.0.0"
+soroban-sdk-macros = "25.0.0"
 
 [profile.release]
 opt-level = "z"

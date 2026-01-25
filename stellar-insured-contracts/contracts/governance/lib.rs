@@ -1,45 +1,16 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracterror, Address, Env, Symbol, Vec};
 
-// Import authorization from the common library
-use insurance_contracts::authorization::{
-    initialize_admin, require_admin, require_governance_permission, Role, get_role
-};
-
 #[contract]
 pub struct GovernanceContract;
 
+const ADMIN: Symbol = Symbol::short("ADMIN");
 const PAUSED: Symbol = Symbol::short("PAUSED");
 const CONFIG: Symbol = Symbol::short("CONFIG");
 const PROPOSAL: Symbol = Symbol::short("PROPOSAL");
 const PROPOSAL_COUNTER: Symbol = Symbol::short("PROP_CNT");
 const VOTER: Symbol = Symbol::short("VOTER");
 const PROPOSAL_LIST: Symbol = Symbol::short("PROP_LIST");
-const SLASHING_CONTRACT: Symbol = Symbol::short("SLASH_CON");
-
-trait SlashingContractClient {
-    fn slash_funds(
-        &self,
-        target: &Address,
-        role: &u32,
-        reason: &u32,
-        amount: &i128,
-    ) -> Result<u64, ContractError>;
-}
-
-impl SlashingContractClient for Address {
-    fn slash_funds(
-        &self,
-        target: &Address,
-        role: &u32,
-        reason: &u32,
-        amount: &i128,
-    ) -> Result<u64, ContractError> {
-        // This is a placeholder implementation
-        // In a real implementation, this would make a cross-contract call
-        Ok(1u64)
-    }
-}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub enum ProposalStatus {
