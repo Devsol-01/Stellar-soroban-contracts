@@ -28,6 +28,8 @@ pub enum DataKey {
     Config,
     Policy(u64),
     PolicyCounter,
+    PolicyStatusHistory(u64), // history_id
+    PolicyStatusHistoryCounter,
 }
 
 #[contracttype]
@@ -36,15 +38,25 @@ pub struct Config {
     pub risk_pool: Address,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyStatusHistory {
+    pub policy_id: u64,
+    pub previous_state: PolicyState,
+    pub new_state: PolicyState,
+    pub actor: Address,
+    pub timestamp: u64,
+}
+
 // Step 1: Define the Policy State Enum
 /// Represents the lifecycle states of a policy.
 /// This is a closed enum with only valid states - no string states allowed.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PolicyState {
-    Active,
-    Expired,
-    Cancelled,
+    ACTIVE,
+    EXPIRED,
+    CANCELLED,
 }
 
 // Step 2: Define Allowed State Transitions
@@ -52,18 +64,18 @@ impl PolicyState {
     /// Validates whether a transition from the current state to the next state is allowed.
     ///
     /// Valid transitions:
-    /// - Active → Expired
-    /// - Active → Cancelled
-    /// - Expired → (no transitions)
-    /// - Cancelled → (no transitions)
+    /// - ACTIVE → EXPIRED
+    /// - ACTIVE → CANCELLED
+    /// - EXPIRED → (no transitions)
+    /// - CANCELLED → (no transitions)
     pub fn can_transition_to(self, next: PolicyState) -> bool {
         match (self, next) {
-            // Active can transition to Expired or Cancelled
-            (PolicyState::Active, PolicyState::Expired) => true,
-            (PolicyState::Active, PolicyState::Cancelled) => true,
-            // Expired and Cancelled are terminal states - no transitions allowed
-            (PolicyState::Expired, _) => false,
-            (PolicyState::Cancelled, _) => false,
+            // ACTIVE can transition to EXPIRED or CANCELLED
+            (PolicyState::ACTIVE, PolicyState::EXPIRED) => true,
+            (PolicyState::ACTIVE, PolicyState::CANCELLED) => true,
+            // EXPIRED and CANCELLED are terminal states - no transitions allowed
+            (PolicyState::EXPIRED, _) => false,
+            (PolicyState::CANCELLED, _) => false,
             // Self-transitions are not allowed
             _ => false,
         }
@@ -85,7 +97,7 @@ pub struct Policy {
 
 // Step 4: Implement Policy Methods
 impl Policy {
-    /// Creates a new policy in Active state
+    /// Creates a new policy in ACTIVE state
     pub fn new(
         holder: Address,
         coverage_amount: i128,
@@ -100,7 +112,7 @@ impl Policy {
             premium_amount,
             start_time,
             end_time,
-            state: PolicyState::Active,
+            state: PolicyState::ACTIVE,
             created_at,
         }
     }
@@ -131,17 +143,115 @@ impl Policy {
 
     /// Checks if the policy is active
     pub fn is_active(&self) -> bool {
-        matches!(self.state, PolicyState::Active)
+        matches!(self.state, PolicyState::ACTIVE)
     }
 
     /// Checks if the policy is expired
     pub fn is_expired(&self) -> bool {
-        matches!(self.state, PolicyState::Expired)
+        matches!(self.state, PolicyState::EXPIRED)
     }
 
     /// Checks if the policy is cancelled
     pub fn is_cancelled(&self) -> bool {
-        matches!(self.state, PolicyState::Cancelled)
+        matches!(self.state, PolicyState::CANCELLED)
+    }
+}
+
+// Step 5: Policy State Machine
+pub struct PolicyStateMachine;
+
+impl PolicyStateMachine {
+    /// Transitions a policy to a new state, validating the transition and recording history
+    pub fn transition(
+        env: &Env,
+        policy_id: u64,
+        target_state: PolicyState,
+        actor: Address,
+    ) -> Result<(), ContractError> {
+        // Get current policy
+        let mut policy: Policy = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Policy(policy_id))
+            .ok_or(ContractError::NotFound)?;
+
+        let previous_state = policy.state();
+
+        // Validate transition
+        if !previous_state.can_transition_to(target_state) {
+            return Err(ContractError::InvalidStateTransition);
+        }
+
+        // Update policy state
+        policy.transition_to(target_state)?;
+
+        // Save updated policy
+        env.storage()
+            .persistent()
+            .set(&DataKey::Policy(policy_id), &policy);
+
+        // Record history
+        let history_id = Self::next_history_id(env);
+        let history = PolicyStatusHistory {
+            policy_id,
+            previous_state,
+            new_state: target_state,
+            actor: actor.clone(),
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::PolicyStatusHistory(history_id), &history);
+
+        // Emit event
+        let event_name = match target_state {
+            PolicyState::ACTIVE => Symbol::new(env, "PolicyActivated"),
+            PolicyState::EXPIRED => Symbol::new(env, "PolicyExpired"),
+            PolicyState::CANCELLED => Symbol::new(env, "PolicyCancelled"),
+        };
+        env.events().publish(
+            (event_name, policy_id),
+            (actor, previous_state, target_state, env.ledger().timestamp()),
+        );
+
+        Ok(())
+    }
+
+    /// Gets the next history ID
+    fn next_history_id(env: &Env) -> u64 {
+        let current_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PolicyStatusHistoryCounter)
+            .unwrap_or(0u64);
+        let next_id = current_id + 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::PolicyStatusHistoryCounter, &next_id);
+        next_id
+    }
+
+    /// Gets policy status history for a policy
+    pub fn get_policy_history(env: &Env, policy_id: u64) -> Vec<PolicyStatusHistory> {
+        let mut history = Vec::new();
+        let counter: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PolicyStatusHistoryCounter)
+            .unwrap_or(0u64);
+
+        for i in 1..=counter {
+            if let Some(h) = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PolicyStatusHistory(i))
+            {
+                if h.policy_id == policy_id {
+                    history.push(h);
+                }
+            }
+        }
+        history
     }
 }
 
@@ -416,52 +526,22 @@ impl PolicyContract {
         Ok((policy.start_time, policy.end_time))
     }
 
-    /// Cancels a policy. Only allowed when the policy is Active.
-    pub fn cancel_policy(env: Env, policy_id: u64) -> Result<(), ContractError> {
-        require_admin(&env)?;
+    /// Cancels a policy. Only allowed when the policy is ACTIVE.
+    pub fn cancel_policy(env: Env, actor: Address, policy_id: u64) -> Result<(), ContractError> {
+        require_admin(&env, &actor)?;
 
-        let mut policy: Policy = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Policy(policy_id))
-            .ok_or(ContractError::NotFound)?;
-
-        // Use the state machine to cancel the policy
-        policy.cancel()?;
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Policy(policy_id), &policy);
-
-        env.events().publish(
-            (Symbol::new(&env, "policy_cancelled"), policy_id),
-            (),
-        );
+        // Use the state machine to transition to CANCELLED
+        PolicyStateMachine::transition(&env, policy_id, PolicyState::CANCELLED, actor)?;
 
         Ok(())
     }
 
-    /// Expires a policy. Only allowed when the policy is Active.
-    pub fn expire_policy(env: Env, policy_id: u64) -> Result<(), ContractError> {
-        require_admin(&env)?;
+    /// Expires a policy. Only allowed when the policy is ACTIVE.
+    pub fn expire_policy(env: Env, actor: Address, policy_id: u64) -> Result<(), ContractError> {
+        require_admin(&env, &actor)?;
 
-        let mut policy: Policy = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Policy(policy_id))
-            .ok_or(ContractError::NotFound)?;
-
-        // Use the state machine to expire the policy
-        policy.expire()?;
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Policy(policy_id), &policy);
-
-        env.events().publish(
-            (Symbol::new(&env, "policy_expired"), policy_id),
-            (),
-        );
+        // Use the state machine to transition to EXPIRED
+        PolicyStateMachine::transition(&env, policy_id, PolicyState::EXPIRED, actor)?;
 
         Ok(())
     }
@@ -604,7 +684,7 @@ mod tests {
         assert_eq!(policy.holder, holder);
         assert_eq!(policy.coverage_amount, coverage);
         assert_eq!(policy.premium_amount, premium);
-        assert_eq!(policy.state(), PolicyState::Active);
+        assert_eq!(policy.state(), PolicyState::ACTIVE);
     }
 
     #[test]
@@ -783,5 +863,105 @@ mod tests {
         assert_eq!(policy_id1, 1);
         assert_eq!(policy_id2, 2);
         assert_ne!(policy_id1, policy_id2);
+    }
+
+    #[test]
+    fn test_state_machine_valid_transitions() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let manager = Address::generate(&env);
+        let holder = Address::generate(&env);
+        let risk_pool = Address::generate(&env);
+
+        PolicyContract::initialize(env.clone(), admin.clone(), risk_pool.clone()).unwrap();
+        PolicyContract::grant_manager_role(env.clone(), admin.clone(), manager.clone()).unwrap();
+
+        let coverage = MIN_COVERAGE_AMOUNT + 1000;
+        let premium = MIN_PREMIUM_AMOUNT + 100;
+        let duration = 30;
+
+        let policy_id = PolicyContract::issue_policy(
+            env.clone(),
+            manager.clone(),
+            holder.clone(),
+            coverage,
+            premium,
+            duration,
+        ).unwrap();
+
+        // Test ACTIVE -> CANCELLED
+        PolicyStateMachine::transition(&env, policy_id, PolicyState::CANCELLED, admin.clone()).unwrap();
+        let policy = PolicyContract::get_policy(env.clone(), policy_id).unwrap();
+        assert_eq!(policy.state(), PolicyState::CANCELLED);
+
+        // Check history
+        let history = PolicyStateMachine::get_policy_history(&env, policy_id);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].previous_state, PolicyState::ACTIVE);
+        assert_eq!(history[0].new_state, PolicyState::CANCELLED);
+    }
+
+    #[test]
+    fn test_state_machine_invalid_transitions() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let manager = Address::generate(&env);
+        let holder = Address::generate(&env);
+        let risk_pool = Address::generate(&env);
+
+        PolicyContract::initialize(env.clone(), admin.clone(), risk_pool.clone()).unwrap();
+        PolicyContract::grant_manager_role(env.clone(), admin.clone(), manager.clone()).unwrap();
+
+        let coverage = MIN_COVERAGE_AMOUNT + 1000;
+        let premium = MIN_PREMIUM_AMOUNT + 100;
+        let duration = 30;
+
+        let policy_id = PolicyContract::issue_policy(
+            env.clone(),
+            manager.clone(),
+            holder.clone(),
+            coverage,
+            premium,
+            duration,
+        ).unwrap();
+
+        // Transition to CANCELLED
+        PolicyStateMachine::transition(&env, policy_id, PolicyState::CANCELLED, admin.clone()).unwrap();
+
+        // Try invalid transition from CANCELLED to EXPIRED
+        let result = PolicyStateMachine::transition(&env, policy_id, PolicyState::EXPIRED, admin.clone());
+        assert_eq!(result, Err(ContractError::InvalidStateTransition));
+    }
+
+    #[test]
+    fn test_state_based_access_control() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let manager = Address::generate(&env);
+        let holder = Address::generate(&env);
+        let risk_pool = Address::generate(&env);
+
+        PolicyContract::initialize(env.clone(), admin.clone(), risk_pool.clone()).unwrap();
+        PolicyContract::grant_manager_role(env.clone(), admin.clone(), manager.clone()).unwrap();
+
+        let coverage = MIN_COVERAGE_AMOUNT + 1000;
+        let premium = MIN_PREMIUM_AMOUNT + 100;
+        let duration = 30;
+
+        let policy_id = PolicyContract::issue_policy(
+            env.clone(),
+            manager.clone(),
+            holder.clone(),
+            coverage,
+            premium,
+            duration,
+        ).unwrap();
+
+        // Cancel the policy
+        PolicyContract::cancel_policy(env.clone(), admin.clone(), policy_id).unwrap();
+
+        // Try to cancel again - should fail due to state
+        let result = PolicyContract::cancel_policy(env.clone(), admin.clone(), policy_id);
+        assert_eq!(result, Err(ContractError::InvalidStateTransition));
     }
 }
