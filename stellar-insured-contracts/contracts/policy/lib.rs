@@ -1,5 +1,6 @@
 #![no_std]
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracterror, contracttype, Address, Env, Symbol, Vec};
 
 // Import authorization from the common library
 use insurance_contracts::authorization::{
@@ -17,6 +18,12 @@ const MIN_PREMIUM_AMOUNT: i128 = 100_000; // 0.1 units
 const MAX_PREMIUM_AMOUNT: i128 = 100_000_000_000_000; // 100k units
 const MIN_POLICY_DURATION_DAYS: u32 = 1;
 const MAX_POLICY_DURATION_DAYS: u32 = 365;
+
+/// Maximum number of policies to return in a single paginated request.
+const MAX_PAGINATION_LIMIT: u32 = 50;
+
+/// Storage key for the list of active policy IDs
+const ACTIVE_POLICY_LIST: Symbol = Symbol::short("ACT_POL");
 
 #[contract]
 pub struct PolicyContract;
@@ -46,6 +53,39 @@ pub struct PolicyStatusHistory {
     pub new_state: PolicyState,
     pub actor: Address,
     pub timestamp: u64,
+}
+
+/// Structured view of a policy for frontend/indexer consumption.
+/// Contains essential policy data in a gas-efficient format.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PolicyView {
+    /// Unique policy identifier
+    pub id: u64,
+    /// Policy holder address
+    pub holder: Address,
+    /// Coverage amount in stroops
+    pub coverage_amount: i128,
+    /// Premium amount in stroops
+    pub premium_amount: i128,
+    /// Policy start timestamp
+    pub start_time: u64,
+    /// Policy end timestamp
+    pub end_time: u64,
+    /// Current state (ACTIVE, EXPIRED, CANCELLED)
+    pub state: PolicyState,
+    /// Timestamp when policy was created
+    pub created_at: u64,
+}
+
+/// Result of a paginated policies query.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PaginatedPoliciesResult {
+    /// List of policies in the current page
+    pub policies: Vec<PolicyView>,
+    /// Total number of active policies (for pagination calculations)
+    pub total_count: u32,
 }
 
 // Step 1: Define the Policy State Enum
@@ -188,6 +228,27 @@ impl PolicyStateMachine {
         // Save updated policy
         env.storage().persistent().set(&DataKey::Policy(policy_id), &policy);
 
+        // Remove from active policy list if transitioning to a terminal state
+        if matches!(target_state, PolicyState::CANCELLED | PolicyState::EXPIRED) {
+            let mut active_list: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&ACTIVE_POLICY_LIST)
+                .unwrap_or_else(|| Vec::new(env));
+
+            // Find and remove the policy ID from the list
+            let mut new_list: Vec<u64> = Vec::new(env);
+            for i in 0..active_list.len() {
+                let id = active_list.get(i).unwrap();
+                if id != policy_id {
+                    new_list.push_back(id);
+                }
+            }
+            env.storage()
+                .persistent()
+                .set(&ACTIVE_POLICY_LIST, &new_list);
+        }
+
         // Record history
         let history_id = Self::next_history_id(env);
         let history = PolicyStatusHistory {
@@ -230,6 +291,7 @@ impl PolicyStateMachine {
     /// Gets policy status history for a policy
     pub fn get_policy_history(env: &Env, policy_id: u64) -> Vec<PolicyStatusHistory> {
         let mut history = Vec::new(env);
+        let mut history: Vec<PolicyStatusHistory> = Vec::new(env);
         let counter: u64 = env
             .storage()
             .persistent()
@@ -241,6 +303,7 @@ impl PolicyStateMachine {
                 .storage()
                 .persistent()
                 .get::<DataKey, PolicyStatusHistory>(&DataKey::PolicyStatusHistory(i))
+                .get::<_, PolicyStatusHistory>(&DataKey::PolicyStatusHistory(i))
             {
                 if h.policy_id == policy_id {
                     history.push_back(h);
@@ -285,6 +348,7 @@ pub enum ContractError {
     NotTrustedContract = 13,
 
     /// Invalid state transition attempted
+    // State transition errors
     InvalidStateTransition = 14,
     // Invariant violation errors (100-199)
     InvalidPolicyState = 101,
@@ -462,6 +526,17 @@ impl PolicyContract {
 
         env.storage().persistent().set(&DataKey::Policy(policy_id), &policy);
 
+        // Add policy ID to the active policy list for efficient querying
+        let mut active_list: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&ACTIVE_POLICY_LIST)
+            .unwrap_or_else(|| Vec::new(&env));
+        active_list.push_back(policy_id);
+        env.storage()
+            .persistent()
+            .set(&ACTIVE_POLICY_LIST, &active_list);
+
         env.events().publish(
             (Symbol::new(&env, "PolicyIssued"), policy_id),
             (holder, coverage_amount, premium_amount, duration_days, manager, current_time),
@@ -564,6 +639,95 @@ impl PolicyContract {
 
     pub fn get_policy_count(env: Env) -> u64 {
         env.storage().persistent().get(&DataKey::PolicyCounter).unwrap_or(0u64)
+    }
+
+    /// Returns a paginated list of active policies with structured view data.
+    /// This is a read-only function optimized for frontend/indexer consumption.
+    ///
+    /// # Arguments
+    /// * `start_index` - Zero-based index to start from in the active policy list
+    /// * `limit` - Maximum number of policies to return (capped at 50)
+    ///
+    /// # Returns
+    /// * `PaginatedPoliciesResult` containing the policies and total count
+    ///
+    /// # Example
+    /// To get the first page: `get_active_policies(0, 50)`
+    /// To get the second page: `get_active_policies(50, 50)`
+    pub fn get_active_policies(
+        env: Env,
+        start_index: u32,
+        limit: u32,
+    ) -> PaginatedPoliciesResult {
+        // Cap the limit to prevent excessive gas consumption
+        let effective_limit = if limit > MAX_PAGINATION_LIMIT {
+            MAX_PAGINATION_LIMIT
+        } else if limit == 0 {
+            MAX_PAGINATION_LIMIT
+        } else {
+            limit
+        };
+
+        // Get the active policy list
+        let active_list: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&ACTIVE_POLICY_LIST)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total_count = active_list.len();
+
+        // Handle out-of-bounds start_index
+        if start_index >= total_count {
+            return PaginatedPoliciesResult {
+                policies: Vec::new(&env),
+                total_count,
+            };
+        }
+
+        // Calculate the actual range to fetch
+        let end_index = core::cmp::min(start_index + effective_limit, total_count);
+
+        // Build the result vector with PolicyView structs
+        let mut policies: Vec<PolicyView> = Vec::new(&env);
+
+        for i in start_index..end_index {
+            let policy_id = active_list.get(i).unwrap();
+
+            // Read the policy data from storage
+            if let Some(policy) = env
+                .storage()
+                .persistent()
+                .get::<_, Policy>(&DataKey::Policy(policy_id))
+            {
+                let view = PolicyView {
+                    id: policy_id,
+                    holder: policy.holder.clone(),
+                    coverage_amount: policy.coverage_amount,
+                    premium_amount: policy.premium_amount,
+                    start_time: policy.start_time,
+                    end_time: policy.end_time,
+                    state: policy.state(),
+                    created_at: policy.created_at,
+                };
+                policies.push_back(view);
+            }
+        }
+
+        PaginatedPoliciesResult {
+            policies,
+            total_count,
+        }
+    }
+
+    /// Returns the count of currently active policies.
+    pub fn get_active_policy_count(env: Env) -> u32 {
+        let active_list: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&ACTIVE_POLICY_LIST)
+            .unwrap_or_else(|| Vec::new(&env));
+        active_list.len()
     }
 
     pub fn is_paused(env: Env) -> bool {

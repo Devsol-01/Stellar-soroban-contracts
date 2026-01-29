@@ -8,9 +8,11 @@ use insurance_contracts::authorization::{
     get_role, initialize_admin, register_trusted_contract, require_admin,
     require_governance_permission, Role,
 };
-
 // Import invariant checks
 use insurance_invariants::{InvariantError, ProtocolInvariants};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, Env, Map, Symbol, Vec,
+};
 
 // ============================================================================
 // Constants
@@ -290,6 +292,7 @@ impl TreasuryContract {
         // Admin-only: use transaction source as the acting address.
         let caller = env.current_contract_address();
         require_admin(&env, &caller)?;
+        require_admin(&env)?;
         validate_address(&env, &contract_address)?;
 
         env.storage().persistent().set(&(TRUSTED_CONTRACTS, &contract_address), &true);
@@ -327,8 +330,8 @@ impl TreasuryContract {
         env.storage().persistent().set(&TOTAL_FEES_COLLECTED, &new_total);
 
         env.events().publish(
-            (Symbol::new(&env, "premium_fee_deposited"), ()),
-            (from.clone(), amount, new_balance),
+            (Symbol::new(&env, "premium_fee_deposited"), from.clone()),
+            (amount, new_balance, new_total),
         );
 
         Ok(())
@@ -363,8 +366,8 @@ impl TreasuryContract {
         env.storage().persistent().set(&TOTAL_FEES_COLLECTED, &new_total);
 
         env.events().publish(
-            (Symbol::new(&env, "claim_penalty_deposited"), ()),
-            (from.clone(), amount, new_balance),
+            (Symbol::new(&env, "claim_penalty_deposited"), from.clone()),
+            (amount, new_balance, new_total),
         );
 
         Ok(())
@@ -399,8 +402,8 @@ impl TreasuryContract {
         env.storage().persistent().set(&TOTAL_FEES_COLLECTED, &new_total);
 
         env.events().publish(
-            (Symbol::new(&env, "slashing_fee_deposited"), ()),
-            (from.clone(), amount, new_balance),
+            (Symbol::new(&env, "slashing_fee_deposited"), from.clone()),
+            (amount, new_balance, new_total),
         );
 
         Ok(())
@@ -436,8 +439,8 @@ impl TreasuryContract {
         env.storage().persistent().set(&TOTAL_FEES_COLLECTED, &new_total);
 
         env.events().publish(
-            (Symbol::new(&env, "fee_deposited"), ()),
-            (from.clone(), amount, fee_type, new_balance),
+            (Symbol::new(&env, "fee_deposited"), from.clone()),
+            (amount, fee_type, new_balance, new_total),
         );
 
         Ok(())
@@ -495,8 +498,14 @@ impl TreasuryContract {
         env.storage().persistent().set(&(WITHDRAWAL_PROPOSALS, proposal_id), &proposal);
 
         env.events().publish(
-            (Symbol::new(&env, "withdrawal_proposed"), ()),
-            (proposal_id, recipient, amount, purpose, proposer, voting_ends_at),
+            (Symbol::new(&env, "withdrawal_proposed"), proposal.recipient.clone()),
+            (
+                proposal_id,
+                proposal.amount,
+                proposal.purpose,
+                proposal.proposed_by,
+                proposal.voting_ends_at,
+            ),
         );
 
         Ok(proposal_id)
@@ -568,8 +577,8 @@ impl TreasuryContract {
         env.storage().persistent().set(&(WITHDRAWAL_PROPOSALS, proposal_id), &proposal);
 
         env.events().publish(
-            (Symbol::new(&env, "withdrawal_executed"), ()),
-            (proposal_id, proposal.recipient.clone(), proposal.amount, new_balance),
+            (Symbol::new(&env, "withdrawal_executed"), proposal.recipient.clone()),
+            (proposal_id, proposal.amount, new_balance, proposal.purpose),
         );
 
         Ok(())
@@ -579,6 +588,7 @@ impl TreasuryContract {
     pub fn reject_proposal(env: Env, proposal_id: u64) -> Result<(), ContractError> {
         let caller = env.current_contract_address();
         require_admin(&env, &caller)?;
+        require_admin(&env)?;
 
         let mut proposal: WithdrawalProposal = env
             .storage()
@@ -594,8 +604,8 @@ impl TreasuryContract {
         env.storage().persistent().set(&(WITHDRAWAL_PROPOSALS, proposal_id), &proposal);
 
         env.events().publish(
-            (Symbol::new(&env, "proposal_rejected"), ()),
-            (proposal_id, proposal.recipient.clone(), proposal.amount),
+            (Symbol::new(&env, "proposal_rejected"), proposal.recipient.clone()),
+            (proposal_id, proposal.amount, proposal.purpose),
         );
 
         Ok(())
@@ -605,6 +615,7 @@ impl TreasuryContract {
     pub fn approve_proposal(env: Env, proposal_id: u64) -> Result<(), ContractError> {
         let caller = env.current_contract_address();
         require_admin(&env, &caller)?;
+        require_admin(&env)?;
 
         let mut proposal: WithdrawalProposal = env
             .storage()
@@ -626,8 +637,8 @@ impl TreasuryContract {
         env.storage().persistent().set(&(WITHDRAWAL_PROPOSALS, proposal_id), &proposal);
 
         env.events().publish(
-            (Symbol::new(&env, "proposal_approved"), ()),
-            (proposal_id, proposal.recipient.clone(), proposal.amount),
+            (Symbol::new(&env, "proposal_approved"), proposal.recipient.clone()),
+            (proposal_id, proposal.amount, proposal.purpose),
         );
 
         Ok(())
@@ -704,5 +715,556 @@ impl TreasuryContract {
             .publish((Symbol::new(&env, "fee_percentage_updated"), ()), new_percentage);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        Address, Env, Symbol,
+    };
+
+    use super::*;
+
+    fn create_test_env() -> (Env, Address, Address, Address) {
+        let env = Env::default();
+        let admin = Address::random(&env);
+        let governance = Address::random(&env);
+        let trusted_contract = Address::random(&env);
+        (env, admin, governance, trusted_contract)
+    }
+
+    #[test]
+    fn test_initialize_treasury() {
+        let (env, admin, governance, _) = create_test_env();
+
+        let result = TreasuryContract::initialize(
+            env.clone(),
+            admin.clone(),
+            governance.clone(),
+            500, // 5% fee
+        );
+
+        assert!(result.is_ok());
+
+        // Verify initial state
+        let stats = TreasuryContract::get_stats(env.clone()).unwrap();
+        assert_eq!(stats.total_balance, 0);
+        assert_eq!(stats.total_fees_collected, 0);
+        assert_eq!(stats.total_withdrawn, 0);
+    }
+
+    #[test]
+    fn test_initialize_already_initialized() {
+        let (env, admin, governance, _) = create_test_env();
+
+        TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 500).unwrap();
+
+        let result =
+            TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 500);
+
+        assert_eq!(result, Err(ContractError::AlreadyInitialized));
+    }
+
+    #[test]
+    fn test_initialize_invalid_fee_percentage() {
+        let (env, admin, governance, _) = create_test_env();
+
+        // Test with 0%
+        let result =
+            TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 0);
+        assert_eq!(result, Err(ContractError::InvalidInput));
+
+        // Test with > 100%
+        let result =
+            TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 10001);
+        assert_eq!(result, Err(ContractError::InvalidInput));
+    }
+
+    #[test]
+    fn test_register_trusted_contract() {
+        let (env, admin, governance, trusted) = create_test_env();
+
+        TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 500).unwrap();
+
+        let result = TreasuryContract::register_trusted_contract(env.clone(), trusted.clone());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_deposit_premium_fee_without_trust() {
+        let (env, admin, governance, untrusted) = create_test_env();
+
+        TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 500).unwrap();
+
+        let depositor = Address::random(&env);
+        let result = TreasuryContract::deposit_premium_fee(env.clone(), depositor.clone(), 1000);
+
+        assert_eq!(result, Err(ContractError::NotTrustedContract));
+    }
+
+    #[test]
+    fn test_deposit_premium_fee_success() {
+        let (env, admin, governance, trusted) = create_test_env();
+
+        TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 500).unwrap();
+        TreasuryContract::register_trusted_contract(env.clone(), trusted.clone()).unwrap();
+
+        env.ledger().set_sequence_number(1);
+        env.mock_all_auths();
+
+        let depositor = Address::random(&env);
+        let result = TreasuryContract::deposit_premium_fee(env.clone(), depositor.clone(), 1000);
+
+        assert!(result.is_ok());
+
+        let balance = TreasuryContract::get_balance(env.clone());
+        assert_eq!(balance, 1000);
+
+        let stats = TreasuryContract::get_stats(env.clone()).unwrap();
+        assert_eq!(stats.total_fees_collected, 1000);
+    }
+
+    #[test]
+    fn test_deposit_premium_fee_invalid_amount() {
+        let (env, admin, governance, trusted) = create_test_env();
+
+        TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 500).unwrap();
+        TreasuryContract::register_trusted_contract(env.clone(), trusted.clone()).unwrap();
+
+        env.mock_all_auths();
+
+        let depositor = Address::random(&env);
+        let result = TreasuryContract::deposit_premium_fee(env.clone(), depositor.clone(), 0);
+        assert_eq!(result, Err(ContractError::InvalidAmount));
+
+        let result = TreasuryContract::deposit_premium_fee(env.clone(), depositor.clone(), -100);
+        assert_eq!(result, Err(ContractError::InvalidAmount));
+    }
+
+    #[test]
+    fn test_deposit_claim_penalty() {
+        let (env, admin, governance, trusted) = create_test_env();
+
+        TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 500).unwrap();
+        TreasuryContract::register_trusted_contract(env.clone(), trusted.clone()).unwrap();
+
+        env.mock_all_auths();
+
+        let depositor = Address::random(&env);
+        let result = TreasuryContract::deposit_claim_penalty(env.clone(), depositor.clone(), 5000);
+
+        assert!(result.is_ok());
+
+        let balance = TreasuryContract::get_balance(env.clone());
+        assert_eq!(balance, 5000);
+    }
+
+    #[test]
+    fn test_deposit_slashing_fee() {
+        let (env, admin, governance, trusted) = create_test_env();
+
+        TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 500).unwrap();
+        TreasuryContract::register_trusted_contract(env.clone(), trusted.clone()).unwrap();
+
+        env.mock_all_auths();
+
+        let depositor = Address::random(&env);
+        let result = TreasuryContract::deposit_slashing_fee(env.clone(), depositor.clone(), 2000);
+
+        assert!(result.is_ok());
+
+        let balance = TreasuryContract::get_balance(env.clone());
+        assert_eq!(balance, 2000);
+    }
+
+    #[test]
+    fn test_multiple_fee_deposits() {
+        let (env, admin, governance, trusted) = create_test_env();
+
+        TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 500).unwrap();
+        TreasuryContract::register_trusted_contract(env.clone(), trusted.clone()).unwrap();
+
+        env.mock_all_auths();
+
+        let depositor = Address::random(&env);
+
+        TreasuryContract::deposit_premium_fee(env.clone(), depositor.clone(), 1000).unwrap();
+        TreasuryContract::deposit_claim_penalty(env.clone(), depositor.clone(), 500).unwrap();
+        TreasuryContract::deposit_slashing_fee(env.clone(), depositor.clone(), 250).unwrap();
+
+        let balance = TreasuryContract::get_balance(env.clone());
+        assert_eq!(balance, 1750);
+
+        let stats = TreasuryContract::get_stats(env.clone()).unwrap();
+        assert_eq!(stats.total_fees_collected, 1750);
+    }
+
+    #[test]
+    fn test_deposit_fee_generic() {
+        let (env, admin, governance, trusted) = create_test_env();
+
+        TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 500).unwrap();
+        TreasuryContract::register_trusted_contract(env.clone(), trusted.clone()).unwrap();
+
+        env.mock_all_auths();
+
+        let depositor = Address::random(&env);
+        let result = TreasuryContract::deposit_fee(env.clone(), depositor.clone(), 3000, 4); // Other fee type
+
+        assert!(result.is_ok());
+
+        let balance = TreasuryContract::get_balance(env.clone());
+        assert_eq!(balance, 3000);
+    }
+
+    #[test]
+    fn test_deposit_when_paused() {
+        let (env, admin, governance, trusted) = create_test_env();
+
+        TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 500).unwrap();
+        TreasuryContract::register_trusted_contract(env.clone(), trusted.clone()).unwrap();
+
+        env.mock_all_auths();
+
+        TreasuryContract::set_pause(env.clone(), true).unwrap();
+
+        let depositor = Address::random(&env);
+        let result = TreasuryContract::deposit_premium_fee(env.clone(), depositor.clone(), 1000);
+
+        assert_eq!(result, Err(ContractError::Paused));
+    }
+
+    #[test]
+    fn test_propose_withdrawal_success() {
+        let (env, admin, governance, trusted) = create_test_env();
+
+        TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 500).unwrap();
+        TreasuryContract::register_trusted_contract(env.clone(), trusted.clone()).unwrap();
+
+        env.mock_all_auths();
+
+        // Deposit funds first
+        let depositor = Address::random(&env);
+        TreasuryContract::deposit_premium_fee(env.clone(), depositor.clone(), 10000).unwrap();
+
+        // Create withdrawal proposal
+        let recipient = Address::random(&env);
+        let proposer = Address::random(&env);
+        let result = TreasuryContract::propose_withdrawal(
+            env.clone(),
+            proposer.clone(),
+            recipient.clone(),
+            5000,
+            1, // AuditFunding
+            Symbol::new(&env, "Audit funding"),
+        );
+
+        assert!(result.is_ok());
+        let proposal_id = result.unwrap();
+        assert_eq!(proposal_id, 1);
+
+        // Verify proposal exists
+        let proposal = TreasuryContract::get_proposal(env.clone(), proposal_id).unwrap();
+        assert_eq!(proposal.amount, 5000);
+        assert_eq!(proposal.recipient, recipient);
+        assert_eq!(proposal.status, 0); // Active
+    }
+
+    #[test]
+    fn test_propose_withdrawal_insufficient_funds() {
+        let (env, admin, governance, trusted) = create_test_env();
+
+        TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 500).unwrap();
+        TreasuryContract::register_trusted_contract(env.clone(), trusted.clone()).unwrap();
+
+        env.mock_all_auths();
+
+        // Deposit only 1000 funds
+        let depositor = Address::random(&env);
+        TreasuryContract::deposit_premium_fee(env.clone(), depositor.clone(), 1000).unwrap();
+
+        // Try to propose withdrawal of 5000
+        let recipient = Address::random(&env);
+        let proposer = Address::random(&env);
+        let result = TreasuryContract::propose_withdrawal(
+            env.clone(),
+            proposer.clone(),
+            recipient.clone(),
+            5000,
+            1,
+            Symbol::new(&env, "Audit funding"),
+        );
+
+        assert_eq!(result, Err(ContractError::InsufficientFunds));
+    }
+
+    #[test]
+    fn test_approve_and_execute_withdrawal() {
+        let (env, admin, governance, trusted) = create_test_env();
+
+        TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 500).unwrap();
+        TreasuryContract::register_trusted_contract(env.clone(), trusted.clone()).unwrap();
+
+        env.mock_all_auths();
+
+        // Deposit funds
+        let depositor = Address::random(&env);
+        TreasuryContract::deposit_premium_fee(env.clone(), depositor.clone(), 10000).unwrap();
+
+        // Create withdrawal proposal
+        let recipient = Address::random(&env);
+        let proposer = Address::random(&env);
+        let proposal_id = TreasuryContract::propose_withdrawal(
+            env.clone(),
+            proposer.clone(),
+            recipient.clone(),
+            5000,
+            1,
+            Symbol::new(&env, "Audit funding"),
+        )
+        .unwrap();
+
+        // Simulate time passing beyond voting period (7 days)
+        env.ledger().set_timestamp(7 * 24 * 60 * 60 + 1);
+
+        // Approve proposal
+        let approve_result = TreasuryContract::approve_proposal(env.clone(), proposal_id);
+        assert!(approve_result.is_ok());
+
+        // Verify proposal status changed to approved
+        let proposal = TreasuryContract::get_proposal(env.clone(), proposal_id).unwrap();
+        assert_eq!(proposal.status, 1); // Approved
+
+        // Execute withdrawal
+        let execute_result = TreasuryContract::execute_withdrawal(env.clone(), proposal_id);
+        assert!(execute_result.is_ok());
+
+        // Verify balance decreased
+        let balance = TreasuryContract::get_balance(env.clone());
+        assert_eq!(balance, 5000);
+
+        // Verify proposal marked as executed
+        let proposal = TreasuryContract::get_proposal(env.clone(), proposal_id).unwrap();
+        assert!(proposal.executed);
+
+        // Verify total withdrawn increased
+        let stats = TreasuryContract::get_stats(env.clone()).unwrap();
+        assert_eq!(stats.total_withdrawn, 5000);
+    }
+
+    #[test]
+    fn test_execute_withdrawal_insufficient_funds() {
+        let (env, admin, governance, trusted) = create_test_env();
+
+        TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 500).unwrap();
+        TreasuryContract::register_trusted_contract(env.clone(), trusted.clone()).unwrap();
+
+        env.mock_all_auths();
+
+        // Deposit only 2000 funds
+        let depositor = Address::random(&env);
+        TreasuryContract::deposit_premium_fee(env.clone(), depositor.clone(), 2000).unwrap();
+
+        // Create withdrawal proposal for 5000
+        let recipient = Address::random(&env);
+        let proposer = Address::random(&env);
+        let proposal_id = TreasuryContract::propose_withdrawal(
+            env.clone(),
+            proposer.clone(),
+            recipient.clone(),
+            1500,
+            1,
+            Symbol::new(&env, "Audit funding"),
+        )
+        .unwrap();
+
+        env.ledger().set_timestamp(7 * 24 * 60 * 60 + 1);
+
+        TreasuryContract::approve_proposal(env.clone(), proposal_id).unwrap();
+
+        // Withdraw some funds to reduce balance
+        let execute_result =
+            TreasuryContract::execute_withdrawal(env.clone(), proposal_id).unwrap();
+
+        // Try to execute same proposal again - should fail
+        let result = TreasuryContract::execute_withdrawal(env.clone(), proposal_id);
+        assert_eq!(result, Err(ContractError::InvalidState)); // Already executed
+    }
+
+    #[test]
+    fn test_reject_proposal() {
+        let (env, admin, governance, trusted) = create_test_env();
+
+        TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 500).unwrap();
+        TreasuryContract::register_trusted_contract(env.clone(), trusted.clone()).unwrap();
+
+        env.mock_all_auths();
+
+        // Deposit funds
+        let depositor = Address::random(&env);
+        TreasuryContract::deposit_premium_fee(env.clone(), depositor.clone(), 10000).unwrap();
+
+        // Create withdrawal proposal
+        let recipient = Address::random(&env);
+        let proposer = Address::random(&env);
+        let proposal_id = TreasuryContract::propose_withdrawal(
+            env.clone(),
+            proposer.clone(),
+            recipient.clone(),
+            5000,
+            1,
+            Symbol::new(&env, "Audit funding"),
+        )
+        .unwrap();
+
+        // Reject proposal
+        let result = TreasuryContract::reject_proposal(env.clone(), proposal_id);
+        assert!(result.is_ok());
+
+        // Verify proposal status changed to rejected
+        let proposal = TreasuryContract::get_proposal(env.clone(), proposal_id).unwrap();
+        assert_eq!(proposal.status, 2); // Rejected
+
+        // Try to execute rejected proposal - should fail
+        let execute_result = TreasuryContract::execute_withdrawal(env.clone(), proposal_id);
+        assert_eq!(execute_result, Err(ContractError::ProposalNotApproved));
+    }
+
+    #[test]
+    fn test_pause_unpause() {
+        let (env, admin, governance, trusted) = create_test_env();
+
+        TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 500).unwrap();
+        TreasuryContract::register_trusted_contract(env.clone(), trusted.clone()).unwrap();
+
+        env.mock_all_auths();
+
+        // Pause contract
+        let result = TreasuryContract::set_pause(env.clone(), true);
+        assert!(result.is_ok());
+
+        // Verify deposits fail
+        let depositor = Address::random(&env);
+        let result = TreasuryContract::deposit_premium_fee(env.clone(), depositor.clone(), 1000);
+        assert_eq!(result, Err(ContractError::Paused));
+
+        // Unpause contract
+        let result = TreasuryContract::set_pause(env.clone(), false);
+        assert!(result.is_ok());
+
+        // Verify deposits work again
+        let result = TreasuryContract::deposit_premium_fee(env.clone(), depositor.clone(), 1000);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_update_fee_percentage() {
+        let (env, admin, governance, _) = create_test_env();
+
+        TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 500).unwrap();
+
+        env.mock_all_auths();
+
+        // Update fee percentage
+        let result = TreasuryContract::update_fee_percentage(env.clone(), 1000); // 10%
+        assert!(result.is_ok());
+
+        // Try invalid percentage (> 100%)
+        let result = TreasuryContract::update_fee_percentage(env.clone(), 10001);
+        assert_eq!(result, Err(ContractError::InvalidInput));
+
+        // Try 0%
+        let result = TreasuryContract::update_fee_percentage(env.clone(), 0);
+        assert_eq!(result, Err(ContractError::InvalidInput));
+    }
+
+    #[test]
+    fn test_allocation_tracking() {
+        let (env, admin, governance, trusted) = create_test_env();
+
+        TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 500).unwrap();
+        TreasuryContract::register_trusted_contract(env.clone(), trusted.clone()).unwrap();
+
+        env.mock_all_auths();
+
+        // Deposit funds
+        let depositor = Address::random(&env);
+        TreasuryContract::deposit_premium_fee(env.clone(), depositor.clone(), 20000).unwrap();
+
+        // Create multiple withdrawal proposals
+        let recipient1 = Address::random(&env);
+        let recipient2 = Address::random(&env);
+        let proposer = Address::random(&env);
+
+        let proposal_id1 = TreasuryContract::propose_withdrawal(
+            env.clone(),
+            proposer.clone(),
+            recipient1.clone(),
+            5000,
+            1, // AuditFunding
+            Symbol::new(&env, "Audit 1"),
+        )
+        .unwrap();
+
+        let proposal_id2 = TreasuryContract::propose_withdrawal(
+            env.clone(),
+            proposer.clone(),
+            recipient2.clone(),
+            3000,
+            2, // DevelopmentGrants
+            Symbol::new(&env, "Development grant"),
+        )
+        .unwrap();
+
+        env.ledger().set_timestamp(7 * 24 * 60 * 60 + 1);
+
+        // Approve and execute both proposals
+        TreasuryContract::approve_proposal(env.clone(), proposal_id1).unwrap();
+        TreasuryContract::execute_withdrawal(env.clone(), proposal_id1).unwrap();
+
+        TreasuryContract::approve_proposal(env.clone(), proposal_id2).unwrap();
+        TreasuryContract::execute_withdrawal(env.clone(), proposal_id2).unwrap();
+
+        // Verify allocations
+        let balance = TreasuryContract::get_balance(env.clone());
+        assert_eq!(balance, 12000); // 20000 - 5000 - 3000
+
+        let stats = TreasuryContract::get_stats(env.clone()).unwrap();
+        assert_eq!(stats.total_withdrawn, 8000);
+        assert_eq!(stats.total_fees_collected, 20000);
+        assert_eq!(stats.total_balance, 12000);
+    }
+
+    #[test]
+    fn test_treasury_invariants() {
+        let (env, admin, governance, trusted) = create_test_env();
+
+        TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 500).unwrap();
+        TreasuryContract::register_trusted_contract(env.clone(), trusted.clone()).unwrap();
+
+        env.mock_all_auths();
+
+        let depositor = Address::random(&env);
+
+        // Test overflow prevention
+        let result =
+            TreasuryContract::deposit_premium_fee(env.clone(), depositor.clone(), i128::MAX);
+        assert!(result.is_ok());
+
+        // Trying to add more should fail
+        let result = TreasuryContract::deposit_premium_fee(env.clone(), depositor.clone(), 1);
+        assert_eq!(result, Err(ContractError::Overflow));
+    }
+
+    #[test]
+    fn test_get_proposal_not_found() {
+        let (env, admin, governance, _) = create_test_env();
+
+        TreasuryContract::initialize(env.clone(), admin.clone(), governance.clone(), 500).unwrap();
+
+        let result = TreasuryContract::get_proposal(env.clone(), 999);
+        assert_eq!(result, Err(ContractError::NotFound));
     }
 }

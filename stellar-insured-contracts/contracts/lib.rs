@@ -114,6 +114,11 @@ pub mod errors {
         /// 🔐 Evidence-specific errors
         EvidenceAlreadyExists = 20,
         EvidenceNotFound = 21,
+        /// Evidence already exists for this claim
+        EvidenceAlreadyExists = 20,
+        /// Evidence not found
+        EvidenceNotFound = 21,
+        /// Invalid evidence hash format
         InvalidEvidenceHash = 22,
     }
 

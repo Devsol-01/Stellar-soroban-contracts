@@ -1,5 +1,6 @@
 #![no_std]
 use soroban_sdk::{contract, contracterror, contractimpl, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracterror, contracttype, Address, Env, Symbol};
 
 // Import authorization from the common library
 use insurance_contracts::authorization::{
@@ -69,6 +70,28 @@ impl From<InvariantError> for ContractError {
             _ => ContractError::InvalidState,
         }
     }
+}
+
+/// Structured view of risk pool statistics for frontend/indexer consumption.
+/// Contains both raw stats and derived metrics for efficient data transfer.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RiskPoolStatsView {
+    /// Total liquidity currently in the pool
+    pub total_liquidity: i128,
+    /// Total amount paid out in claims
+    pub total_claims_paid: i128,
+    /// Total deposits made to the pool
+    pub total_deposits: i128,
+    /// Number of liquidity providers
+    pub provider_count: u64,
+    /// Amount reserved for pending/approved claims
+    pub reserved_for_claims: i128,
+    /// Liquidity available for new claims (total_liquidity - reserved)
+    pub available_liquidity: i128,
+    /// Utilization rate in basis points (reserved / total * 10000)
+    /// Returns 0 if total_liquidity is 0
+    pub utilization_rate_bps: u32,
 }
 
 fn validate_address(_env: &Env, _address: &Address) -> Result<(), ContractError> {
@@ -199,6 +222,11 @@ impl RiskPoolContract {
     pub fn get_pool_stats(env: Env) -> Result<(i128, i128, i128, u64), ContractError> {
         let stats: (i128, i128, i128, u64) =
             env.storage().persistent().get(&POOL_STATS).ok_or(ContractError::NotFound)?;
+        let stats: (i128, i128, i128, u64) = env
+            .storage()
+            .persistent()
+            .get(&POOL_STATS)
+            .ok_or(ContractError::NotFound)?;
 
         Ok(stats)
     }
@@ -207,6 +235,65 @@ impl RiskPoolContract {
         env: Env,
         provider: Address,
     ) -> Result<(i128, i128, u64), ContractError> {
+    /// Returns a structured view of the risk pool statistics with derived metrics.
+    /// This is a read-only function optimized for frontend/indexer consumption.
+    ///
+    /// # Returns
+    /// - `RiskPoolStatsView` containing raw stats and calculated metrics
+    ///
+    /// # Derived Metrics
+    /// - `available_liquidity`: total_liquidity - reserved_for_claims
+    /// - `utilization_rate_bps`: (reserved / total) * 10000 basis points
+    pub fn get_risk_pool_stats_view(env: Env) -> Result<RiskPoolStatsView, ContractError> {
+        // Read raw pool stats: (total_liquidity, total_claims_paid, total_deposits, provider_count)
+        let stats: (i128, i128, i128, u64) = env
+            .storage()
+            .persistent()
+            .get(&POOL_STATS)
+            .ok_or(ContractError::NotFound)?;
+
+        // Read reserved amount for pending claims
+        let reserved_for_claims: i128 = env
+            .storage()
+            .persistent()
+            .get(&RESERVED_TOTAL)
+            .unwrap_or(0i128);
+
+        // Calculate derived metrics
+        let total_liquidity = stats.0;
+        let available_liquidity = total_liquidity
+            .checked_sub(reserved_for_claims)
+            .unwrap_or(0i128);
+
+        // Calculate utilization rate in basis points (0-10000)
+        // utilization = (reserved / total) * 10000
+        let utilization_rate_bps: u32 = if total_liquidity > 0 {
+            let rate = reserved_for_claims
+                .checked_mul(10000)
+                .and_then(|v| v.checked_div(total_liquidity))
+                .unwrap_or(0);
+            // Clamp to u32 max (should never exceed 10000 in normal operation)
+            if rate > u32::MAX as i128 {
+                u32::MAX
+            } else {
+                rate as u32
+            }
+        } else {
+            0u32
+        };
+
+        Ok(RiskPoolStatsView {
+            total_liquidity,
+            total_claims_paid: stats.1,
+            total_deposits: stats.2,
+            provider_count: stats.3,
+            reserved_for_claims,
+            available_liquidity,
+            utilization_rate_bps,
+        })
+    }
+
+    pub fn get_provider_info(env: Env, provider: Address) -> Result<(i128, i128, u64), ContractError> {
         validate_address(&env, &provider)?;
 
         let provider_info: (i128, i128, u64) = env

@@ -7,6 +7,37 @@ use soroban_sdk::{
 // Import the Policy contract interface to verify ownership and coverage
 // NOTE: policy contract client import omitted in this workspace build; it requires
 // a pre-built wasm artifact at build-time.
+use soroban_sdk::{contract, contractimpl, contracterror, contracttype, Address, Env, Symbol, symbol_short, IntoVal, Vec};
+
+// Import the Policy contract interface to verify ownership and coverage
+#[cfg(not(test))]
+mod policy_contract {
+    soroban_sdk::contractimport!(file = "../../target/wasm32-unknown-unknown/release/policy_contract.wasm");
+}
+
+// Mock policy contract client for tests
+#[cfg(test)]
+mod policy_contract {
+    use soroban_sdk::{Address, Env, contractclient};
+
+    // Mock client that returns test data
+    pub struct Client<'a> {
+        _env: &'a Env,
+        _contract_id: &'a Address,
+    }
+
+    impl<'a> Client<'a> {
+        pub fn new(env: &'a Env, contract_id: &'a Address) -> Self {
+            Self { _env: env, _contract_id: contract_id }
+        }
+
+        // Mock get_policy returns (holder, coverage_amount, ...)
+        pub fn get_policy(&self, _policy_id: &u64) -> (Address, i128, i128, u64, u64) {
+            // Return mock data - this won't be used in our unit tests
+            panic!("Mock policy_contract::Client::get_policy called - use unit tests that don't call submit_claim")
+        }
+    }
+}
 
 // Import shared types and authorization from the common library
 use insurance_contracts::authorization::{
@@ -40,6 +71,14 @@ const CLAIM_ORACLE_ID: Symbol = symbol_short!("CLM_OID");
 // NOTE: Keys used for storing oracle data IDs per claim.
 const ORACLE_CFG: Symbol = ORACLE_CONFIG;
 const CLM_ORA: Symbol = CLAIM_ORACLE_ID;
+const CLM_ORA: Symbol = symbol_short!("CLM_ORA");
+
+// New storage keys for claim indexing
+const CLAIM_LIST: Symbol = symbol_short!("CLM_LST");
+const CLAIM_COUNTER: Symbol = symbol_short!("CLM_CNT");
+
+/// Maximum number of claims to return in a single paginated request.
+const MAX_PAGINATION_LIMIT: u32 = 50;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -98,6 +137,35 @@ impl From<InvariantError> for ContractError {
             _ => ContractError::InvalidState,
         }
     }
+}
+
+/// Structured view of a claim for frontend/indexer consumption.
+/// Contains essential claim data in a gas-efficient format.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ClaimView {
+    /// Unique claim identifier
+    pub id: u64,
+    /// Associated policy identifier
+    pub policy_id: u64,
+    /// Claimant address
+    pub claimant: Address,
+    /// Claimed amount in stroops
+    pub amount: i128,
+    /// Current claim status
+    pub status: ClaimStatus,
+    /// Timestamp when claim was submitted
+    pub submitted_at: u64,
+}
+
+/// Result of a paginated claims query.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PaginatedClaimsResult {
+    /// List of claims in the current page
+    pub claims: Vec<ClaimView>,
+    /// Total number of matching claims (for pagination calculations)
+    pub total_count: u32,
 }
 
 fn validate_address(_env: &Env, _address: &Address) -> Result<(), ContractError> {
@@ -208,6 +276,10 @@ impl ClaimsContract {
     /// Get current oracle configuration
     pub fn get_oracle_config(env: Env) -> Result<OracleValidationConfig, ContractError> {
         env.storage().persistent().get(&ORACLE_CFG).ok_or(ContractError::NotFound)
+        env.storage()
+            .persistent()
+            .get(&ORACLE_CONFIG)
+            .ok_or(ContractError::NotFound)
     }
 
     /// Validate claim using oracle data
@@ -220,6 +292,11 @@ impl ClaimsContract {
         // Get oracle configuration
         let oracle_config: OracleValidationConfig =
             env.storage().persistent().get(&ORACLE_CFG).ok_or(ContractError::NotFound)?;
+        let oracle_config: OracleValidationConfig = env
+            .storage()
+            .persistent()
+            .get(&ORACLE_CONFIG)
+            .ok_or(ContractError::NotFound)?;
 
         if !oracle_config.require_oracle_validation {
             return Ok(true);
@@ -261,6 +338,8 @@ impl ClaimsContract {
             .ok_or(ContractError::NotFound)
     }
 
+    /// Submit a new claim for a policy.
+    /// Uses sequential claim IDs for predictable indexing.
     pub fn submit_claim(
         env: Env,
         claimant: Address,
@@ -287,7 +366,7 @@ impl ClaimsContract {
             return Err(ContractError::Unauthorized);
         }
 
-        // 3. DUPLICATE CHECK (Check if this specific policy already has a claim)
+        // 4. DUPLICATE CHECK (Check if this specific policy already has a claim)
         if env.storage().persistent().has(&(POLICY_CLAIM, policy_id)) {
             return Err(ContractError::AlreadyExists);
         }
@@ -300,6 +379,8 @@ impl ClaimsContract {
         // ID Generation
         let seq: u64 = env.ledger().sequence().into();
         let claim_id = seq + 1;
+        // Sequential ID Generation (replacing ledger sequence-based IDs)
+        let claim_id = Self::next_claim_id(&env);
         let current_time = env.ledger().timestamp();
 
         // I3: Initial state must be Submitted
@@ -308,6 +389,30 @@ impl ClaimsContract {
         env.storage().persistent().set(
             &(CLAIM, claim_id),
             &(policy_id, claimant.clone(), amount, initial_status, current_time),
+        // Store the claim
+        env.storage()
+            .persistent()
+            .set(&(CLAIM, claim_id), &(policy_id, claimant.clone(), amount, initial_status, current_time));
+
+        // Map policy to claim for duplicate prevention
+        env.storage()
+            .persistent()
+            .set(&(POLICY_CLAIM, policy_id), &claim_id);
+
+        // Add claim ID to the claim list for efficient querying
+        let mut claim_list: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&CLAIM_LIST)
+            .unwrap_or_else(|| Vec::new(&env));
+        claim_list.push_back(claim_id);
+        env.storage()
+            .persistent()
+            .set(&CLAIM_LIST, &claim_list);
+
+        env.events().publish(
+            (symbol_short!("clm_sub"), claim_id),
+            (policy_id, amount, claimant.clone()),
         );
 
         env.storage().persistent().set(&(POLICY_CLAIM, policy_id), &claim_id);
@@ -322,6 +427,21 @@ impl ClaimsContract {
         env: Env,
         claim_id: u64,
     ) -> Result<(u64, Address, i128, ClaimStatus, u64), ContractError> {
+    /// Gets the next sequential claim ID and increments the counter.
+    fn next_claim_id(env: &Env) -> u64 {
+        let current_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&CLAIM_COUNTER)
+            .unwrap_or(0u64);
+        let next_id = current_id + 1;
+        env.storage()
+            .persistent()
+            .set(&CLAIM_COUNTER, &next_id);
+        next_id
+    }
+
+    pub fn get_claim(env: Env, claim_id: u64) -> Result<(u64, Address, i128, ClaimStatus, u64), ContractError> {
         let claim: (u64, Address, i128, ClaimStatus, u64) = env
             .storage()
             .persistent()
@@ -361,6 +481,7 @@ impl ClaimsContract {
         if let Some(oracle_config) =
             env.storage().persistent().get::<Symbol, OracleValidationConfig>(&ORACLE_CONFIG)
         {
+        if let Some(oracle_config) = env.storage().persistent().get::<_, OracleValidationConfig>(&ORACLE_CONFIG) {
             if oracle_config.require_oracle_validation {
                 if let Some(oracle_id) = oracle_data_id {
                     // Verify oracle contract is trusted
@@ -569,6 +690,182 @@ impl ClaimsContract {
     /// Get the role of an address
     pub fn get_user_role(env: Env, address: Address) -> Role {
         get_role(&env, &address)
+    }
+
+    /// Returns the total number of claims submitted.
+    pub fn get_claim_count(env: Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&CLAIM_COUNTER)
+            .unwrap_or(0u64)
+    }
+
+    /// Returns a paginated list of claims filtered by status.
+    /// This is a read-only function optimized for frontend/indexer consumption.
+    ///
+    /// # Arguments
+    /// * `status` - The ClaimStatus to filter by
+    /// * `start_index` - Zero-based index to start from in the filtered results
+    /// * `limit` - Maximum number of claims to return (capped at 50)
+    ///
+    /// # Returns
+    /// * `PaginatedClaimsResult` containing matching claims and total matching count
+    ///
+    /// # Performance Note
+    /// This function iterates over all claims to filter by status.
+    /// For very large claim sets, consider using events/indexer for status-based queries.
+    pub fn get_claims_by_status(
+        env: Env,
+        status: ClaimStatus,
+        start_index: u32,
+        limit: u32,
+    ) -> PaginatedClaimsResult {
+        // Cap the limit to prevent excessive gas consumption
+        let effective_limit = if limit > MAX_PAGINATION_LIMIT {
+            MAX_PAGINATION_LIMIT
+        } else if limit == 0 {
+            MAX_PAGINATION_LIMIT
+        } else {
+            limit
+        };
+
+        // Get the claim list
+        let claim_list: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&CLAIM_LIST)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Collect matching claim IDs
+        let mut matching_ids: Vec<u64> = Vec::new(&env);
+
+        for i in 0..claim_list.len() {
+            let claim_id = claim_list.get(i).unwrap();
+
+            // Read claim data to check status
+            if let Some(claim_data) = env
+                .storage()
+                .persistent()
+                .get::<_, (u64, Address, i128, ClaimStatus, u64)>(&(CLAIM, claim_id))
+            {
+                if claim_data.3 == status {
+                    matching_ids.push_back(claim_id);
+                }
+            }
+        }
+
+        let total_count = matching_ids.len();
+
+        // Handle out-of-bounds start_index
+        if start_index >= total_count {
+            return PaginatedClaimsResult {
+                claims: Vec::new(&env),
+                total_count,
+            };
+        }
+
+        // Calculate the actual range to fetch
+        let end_index = core::cmp::min(start_index + effective_limit, total_count);
+
+        // Build the result vector with ClaimView structs
+        let mut claims: Vec<ClaimView> = Vec::new(&env);
+
+        for i in start_index..end_index {
+            let claim_id = matching_ids.get(i).unwrap();
+
+            if let Some(claim_data) = env
+                .storage()
+                .persistent()
+                .get::<_, (u64, Address, i128, ClaimStatus, u64)>(&(CLAIM, claim_id))
+            {
+                let view = ClaimView {
+                    id: claim_id,
+                    policy_id: claim_data.0,
+                    claimant: claim_data.1,
+                    amount: claim_data.2,
+                    status: claim_data.3,
+                    submitted_at: claim_data.4,
+                };
+                claims.push_back(view);
+            }
+        }
+
+        PaginatedClaimsResult {
+            claims,
+            total_count,
+        }
+    }
+
+    /// Returns a paginated list of all claims (regardless of status).
+    /// This is a read-only function optimized for frontend/indexer consumption.
+    ///
+    /// # Arguments
+    /// * `start_index` - Zero-based index to start from
+    /// * `limit` - Maximum number of claims to return (capped at 50)
+    ///
+    /// # Returns
+    /// * `PaginatedClaimsResult` containing claims and total count
+    pub fn get_claims_paginated(
+        env: Env,
+        start_index: u32,
+        limit: u32,
+    ) -> PaginatedClaimsResult {
+        // Cap the limit to prevent excessive gas consumption
+        let effective_limit = if limit > MAX_PAGINATION_LIMIT {
+            MAX_PAGINATION_LIMIT
+        } else if limit == 0 {
+            MAX_PAGINATION_LIMIT
+        } else {
+            limit
+        };
+
+        // Get the claim list
+        let claim_list: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&CLAIM_LIST)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total_count = claim_list.len();
+
+        // Handle out-of-bounds start_index
+        if start_index >= total_count {
+            return PaginatedClaimsResult {
+                claims: Vec::new(&env),
+                total_count,
+            };
+        }
+
+        // Calculate the actual range to fetch
+        let end_index = core::cmp::min(start_index + effective_limit, total_count);
+
+        // Build the result vector with ClaimView structs
+        let mut claims: Vec<ClaimView> = Vec::new(&env);
+
+        for i in start_index..end_index {
+            let claim_id = claim_list.get(i).unwrap();
+
+            if let Some(claim_data) = env
+                .storage()
+                .persistent()
+                .get::<_, (u64, Address, i128, ClaimStatus, u64)>(&(CLAIM, claim_id))
+            {
+                let view = ClaimView {
+                    id: claim_id,
+                    policy_id: claim_data.0,
+                    claimant: claim_data.1,
+                    amount: claim_data.2,
+                    status: claim_data.3,
+                    submitted_at: claim_data.4,
+                };
+                claims.push_back(view);
+            }
+        }
+
+        PaginatedClaimsResult {
+            claims,
+            total_count,
+        }
     }
 }
 

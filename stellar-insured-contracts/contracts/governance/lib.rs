@@ -2,6 +2,12 @@
 use soroban_sdk::{contract, contracterror, contractimpl, Address, Env, Symbol, Vec};
 
 use insurance_contracts::authorization::{get_role, initialize_admin, require_admin, Role};
+use soroban_sdk::{contract, contractimpl, contracterror, contracttype, Address, Env, Symbol, Vec};
+
+// Import authorization from the common library
+use insurance_contracts::authorization::{
+    initialize_admin, require_admin, Role, get_role
+};
 
 #[contract]
 pub struct GovernanceContract;
@@ -14,6 +20,7 @@ const PROPOSAL_COUNTER: Symbol = Symbol::short("PROP_CNT");
 const VOTER: Symbol = Symbol::short("VOTER");
 const PROPOSAL_LIST: Symbol = Symbol::short("PROP_LIST");
 const SLASHING_CONTRACT: Symbol = Symbol::short("SLASHING");
+const SLASHING_CONTRACT: Symbol = Symbol::short("SLASH_C");
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub enum ProposalStatus {
@@ -74,6 +81,45 @@ impl From<insurance_contracts::authorization::AuthError> for ContractError {
             }
         }
     }
+}
+
+/// Maximum number of proposals to return in a single paginated request.
+/// This limit prevents excessive gas consumption when iterating over proposals.
+const MAX_PAGINATION_LIMIT: u32 = 50;
+
+/// Structured view of a governance proposal for frontend/indexer consumption.
+/// Contains essential proposal data in a gas-efficient format.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProposalView {
+    /// Unique proposal identifier
+    pub id: u64,
+    /// Address of the proposal creator
+    pub proposer: Address,
+    /// Short title of the proposal
+    pub title: Symbol,
+    /// Current status (0=Active, 1=Passed, 2=Rejected, 3=Executed, 4=Expired)
+    pub status: u32,
+    /// Total votes in favor
+    pub yes_votes: i128,
+    /// Total votes against
+    pub no_votes: i128,
+    /// Number of unique voters
+    pub total_voters: u32,
+    /// Timestamp when voting period ends
+    pub voting_ends_at: u64,
+    /// Required percentage for proposal to pass
+    pub threshold_percentage: u32,
+}
+
+/// Result of a paginated proposals query.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PaginatedProposalsResult {
+    /// List of proposals in the current page
+    pub proposals: Vec<ProposalView>,
+    /// Total number of proposals (for pagination calculations)
+    pub total_count: u32,
 }
 
 fn validate_address(_env: &Env, _address: &Address) -> Result<(), ContractError> {
@@ -585,8 +631,210 @@ impl GovernanceContract {
 
     pub fn get_proposal_count(env: Env) -> Result<u64, ContractError> {
         let count: u64 = env.storage().persistent().get(&PROPOSAL_COUNTER).unwrap_or(0);
+        let count: u64 = env
+            .storage()
+            .persistent()
+            .get(&PROPOSAL_COUNTER)
+            .unwrap_or(0);
 
         Ok(count)
+    }
+
+    /// Returns the list of all proposal IDs.
+    /// This is a read-only function.
+    pub fn get_all_proposals(env: Env) -> Result<Vec<u64>, ContractError> {
+        let proposal_list: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&PROPOSAL_LIST)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        Ok(proposal_list)
+    }
+
+    /// Returns a paginated list of proposals with structured view data.
+    /// This is a read-only function optimized for frontend/indexer consumption.
+    ///
+    /// # Arguments
+    /// * `start_index` - Zero-based index to start from in the proposal list
+    /// * `limit` - Maximum number of proposals to return (capped at 50)
+    ///
+    /// # Returns
+    /// * `PaginatedProposalsResult` containing the proposals and total count
+    ///
+    /// # Example
+    /// To get the first page: `get_proposals_paginated(0, 50)`
+    /// To get the second page: `get_proposals_paginated(50, 50)`
+    pub fn get_proposals_paginated(
+        env: Env,
+        start_index: u32,
+        limit: u32,
+    ) -> Result<PaginatedProposalsResult, ContractError> {
+        // Cap the limit to prevent excessive gas consumption
+        let effective_limit = if limit > MAX_PAGINATION_LIMIT {
+            MAX_PAGINATION_LIMIT
+        } else if limit == 0 {
+            MAX_PAGINATION_LIMIT
+        } else {
+            limit
+        };
+
+        // Get the full proposal list
+        let proposal_list: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&PROPOSAL_LIST)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total_count = proposal_list.len();
+
+        // Handle out-of-bounds start_index
+        if start_index >= total_count {
+            return Ok(PaginatedProposalsResult {
+                proposals: Vec::new(&env),
+                total_count,
+            });
+        }
+
+        // Calculate the actual range to fetch
+        let end_index = core::cmp::min(start_index + effective_limit, total_count);
+
+        // Build the result vector with ProposalView structs
+        let mut proposals: Vec<ProposalView> = Vec::new(&env);
+
+        for i in start_index..end_index {
+            let proposal_id = proposal_list.get(i).unwrap();
+
+            // Read the proposal data from storage
+            // Proposal tuple: (id, proposer, title, description, created_at, voting_ends_at, threshold, status, yes_votes, no_votes, voter_count, execution_data)
+            if let Some(proposal_data) = env
+                .storage()
+                .persistent()
+                .get::<_, (u64, Address, Symbol, Symbol, u64, u64, u32, u32, i128, i128, u32, Symbol)>(
+                    &(PROPOSAL, proposal_id),
+                )
+            {
+                let view = ProposalView {
+                    id: proposal_data.0,
+                    proposer: proposal_data.1,
+                    title: proposal_data.2,
+                    status: proposal_data.7,
+                    yes_votes: proposal_data.8,
+                    no_votes: proposal_data.9,
+                    total_voters: proposal_data.10,
+                    voting_ends_at: proposal_data.5,
+                    threshold_percentage: proposal_data.6,
+                };
+                proposals.push_back(view);
+            }
+        }
+
+        Ok(PaginatedProposalsResult {
+            proposals,
+            total_count,
+        })
+    }
+
+    /// Returns a paginated list of proposals filtered by status.
+    /// This is a read-only function optimized for frontend/indexer consumption.
+    ///
+    /// # Arguments
+    /// * `status` - The status to filter by (0=Active, 1=Passed, 2=Rejected, 3=Executed, 4=Expired)
+    /// * `start_index` - Zero-based index to start from in the filtered results
+    /// * `limit` - Maximum number of proposals to return (capped at 50)
+    ///
+    /// # Returns
+    /// * `PaginatedProposalsResult` containing matching proposals and total matching count
+    ///
+    /// # Note
+    /// This function iterates over all proposals to filter by status.
+    /// For large proposal sets, consider using events/indexer for status-based queries.
+    pub fn get_proposals_by_status(
+        env: Env,
+        status: u32,
+        start_index: u32,
+        limit: u32,
+    ) -> Result<PaginatedProposalsResult, ContractError> {
+        // Cap the limit to prevent excessive gas consumption
+        let effective_limit = if limit > MAX_PAGINATION_LIMIT {
+            MAX_PAGINATION_LIMIT
+        } else if limit == 0 {
+            MAX_PAGINATION_LIMIT
+        } else {
+            limit
+        };
+
+        // Get the full proposal list
+        let proposal_list: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&PROPOSAL_LIST)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // First pass: count matching proposals and collect IDs
+        let mut matching_ids: Vec<u64> = Vec::new(&env);
+
+        for i in 0..proposal_list.len() {
+            let proposal_id = proposal_list.get(i).unwrap();
+
+            if let Some(proposal_data) = env
+                .storage()
+                .persistent()
+                .get::<_, (u64, Address, Symbol, Symbol, u64, u64, u32, u32, i128, i128, u32, Symbol)>(
+                    &(PROPOSAL, proposal_id),
+                )
+            {
+                if proposal_data.7 == status {
+                    matching_ids.push_back(proposal_id);
+                }
+            }
+        }
+
+        let total_count = matching_ids.len();
+
+        // Handle out-of-bounds start_index
+        if start_index >= total_count {
+            return Ok(PaginatedProposalsResult {
+                proposals: Vec::new(&env),
+                total_count,
+            });
+        }
+
+        // Calculate the actual range to fetch
+        let end_index = core::cmp::min(start_index + effective_limit, total_count);
+
+        // Build the result vector with ProposalView structs
+        let mut proposals: Vec<ProposalView> = Vec::new(&env);
+
+        for i in start_index..end_index {
+            let proposal_id = matching_ids.get(i).unwrap();
+
+            if let Some(proposal_data) = env
+                .storage()
+                .persistent()
+                .get::<_, (u64, Address, Symbol, Symbol, u64, u64, u32, u32, i128, i128, u32, Symbol)>(
+                    &(PROPOSAL, proposal_id),
+                )
+            {
+                let view = ProposalView {
+                    id: proposal_data.0,
+                    proposer: proposal_data.1,
+                    title: proposal_data.2,
+                    status: proposal_data.7,
+                    yes_votes: proposal_data.8,
+                    no_votes: proposal_data.9,
+                    total_voters: proposal_data.10,
+                    voting_ends_at: proposal_data.5,
+                    threshold_percentage: proposal_data.6,
+                };
+                proposals.push_back(view);
+            }
+        }
+
+        Ok(PaginatedProposalsResult {
+            proposals,
+            total_count,
+        })
     }
 
     /// Grant governance role to an address (admin only)
